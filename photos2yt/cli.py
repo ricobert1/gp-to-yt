@@ -9,6 +9,7 @@ from typing import Optional, Sequence
 
 from photos2yt.auth import AuthError, authenticate, check_authorization
 from photos2yt.config import ConfigError, load_config
+from photos2yt.takeout import TakeoutError, ingest
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -39,6 +40,12 @@ def create_parser() -> argparse.ArgumentParser:
     # ingest command (Task 4)
     ingest_parser = subparsers.add_parser("ingest", help="Ingest videos and sidecars from staging directory")
     ingest_parser.add_argument("--dry-run", action="store_true", help="Scan and report without writing to database")
+    ingest_parser.add_argument(
+        "--report",
+        dest="report_path",
+        default=None,
+        help="Path to write ingest CSV report (default: ingest_report.csv)",
+    )
 
     # upload command (Task 6)
     upload_parser = subparsers.add_parser("upload", help="Upload pending videos to YouTube")
@@ -86,6 +93,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 authenticate(config=config, no_browser=args.no_browser)
                 return 0
 
+        if args.subcommand == "ingest":
+            report_p = Path(args.report_path).resolve() if args.report_path else None
+            summary = ingest(config=config, dry_run=args.dry_run, report_path=report_p)
+
+            mode_str = "[DRY RUN] " if args.dry_run else ""
+            print(f"{mode_str}Ingest complete:")
+            print(f"  Total videos scanned:    {summary.total_scanned}")
+            print(f"  New pending for upload:  {summary.new_pending}")
+            print(f"  Skipped (duplicates):    {summary.skipped}")
+            print(f"  Already in database:     {summary.already_present}")
+            print(f"  Long files (> 15 min):   {summary.long_file_count}")
+            print(f"  Sidecar matcher tiers:   {dict(summary.matched_by_tier)}")
+            print(f"  Date sources used:       {dict(summary.date_source_counts)}")
+            if summary.report_path:
+                print(f"  CSV report written to:   {summary.report_path}")
+            return 0
+
         print(f"Command '{args.subcommand}' not yet implemented. Configuration loaded successfully.")
         return 0
     except ConfigError as err:
@@ -93,6 +117,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     except AuthError as err:
         sys.stderr.write(f"Authentication error:\n{err}\n")
+        return 1
+    except TakeoutError as err:
+        sys.stderr.write(f"Takeout error:\n{err}\n")
         return 1
     except Exception as err:
         sys.stderr.write(f"Unexpected error: {err}\n")
