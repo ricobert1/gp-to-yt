@@ -228,7 +228,7 @@ def test_schema_migration_idempotent_memory():
     cursor = conn.cursor()
     cursor.execute("SELECT version FROM schema_migrations")
     versions = [row[0] for row in cursor.fetchall()]
-    assert versions == [1]
+    assert versions == [1, 2]
 
 
 def test_schema_migration_idempotent_file(tmp_path: Path):
@@ -282,21 +282,165 @@ def test_schema_migration_idempotent_file(tmp_path: Path):
 
 # --- Database Constraints & Integrity Tests ---
 
-def test_unique_sha256_constraint(memory_db: sqlite3.Connection):
-    """Duplicate SHA256 hashes must raise sqlite3.IntegrityError."""
+def test_source_path_unique_constraint(memory_db: sqlite3.Connection):
+    """Duplicate source_path must raise sqlite3.IntegrityError."""
     insert_video(
         memory_db,
-        source_path="/staging/a.mp4",
-        sha256="duplicate_sha",
+        source_path="/staging/duplicate_path.mp4",
+        sha256="sha_alpha",
         size_bytes=100,
     )
     with pytest.raises(sqlite3.IntegrityError):
         insert_video(
             memory_db,
-            source_path="/staging/b.mp4",
-            sha256="duplicate_sha",
+            source_path="/staging/duplicate_path.mp4",
+            sha256="sha_beta",
             size_bytes=200,
         )
+
+
+def test_sha256_not_unique_and_duplicate_of(memory_db: sqlite3.Connection):
+    """Multiple rows can hold the same sha256 with duplicate_of referencing canonical video."""
+    canonical_id = insert_video(
+        memory_db,
+        source_path="/staging/canonical.mp4",
+        sha256="shared_real_sha256",
+        size_bytes=500,
+        status=VideoStatus.PENDING,
+    )
+    dup_id = insert_video(
+        memory_db,
+        source_path="/staging/duplicate.mp4",
+        sha256="shared_real_sha256",
+        size_bytes=500,
+        status=VideoStatus.SKIPPED,
+        duplicate_of=canonical_id,
+        last_error=f"Duplicate of /staging/canonical.mp4",
+    )
+
+    canonical = get_video(memory_db, canonical_id)
+    dup = get_video(memory_db, dup_id)
+    assert canonical is not None and dup is not None
+    assert canonical.sha256 == dup.sha256 == "shared_real_sha256"
+    assert canonical.duplicate_of is None
+    assert dup.duplicate_of == canonical_id
+    assert dup.status == VideoStatus.SKIPPED
+
+    # Invalid duplicate_of referencing non-existent id must raise IntegrityError
+    with pytest.raises(sqlite3.IntegrityError):
+        insert_video(
+            memory_db,
+            source_path="/staging/invalid_ref.mp4",
+            sha256="shared_real_sha256",
+            size_bytes=500,
+            status=VideoStatus.SKIPPED,
+            duplicate_of=999999,
+        )
+
+
+def test_migration_v1_to_v2_preserves_existing_data(tmp_path: Path):
+    """Applying migration 2 on an existing v1 database preserves all data, cleans :dup: hashes, and keeps constraints."""
+    db_file = tmp_path / "v1_legacy.db"
+    conn = get_connection(db_file)
+
+    # 1. Apply only migration 1
+    from photos2yt.db import MIGRATIONS, _iso_now
+    with conn:
+        conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);")
+        for stmt in MIGRATIONS[1]:
+            conn.execute(stmt)
+        conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)", (_iso_now(),))
+
+    # Insert test data into v1 schema
+    real_hash = "a" * 64
+    fake_dup_hash = f"{real_hash}:dup:1234abcd"
+    other_hash = "b" * 64
+
+    conn.execute(
+        """
+        INSERT INTO videos (id, source_path, sha256, size_bytes, status, created_at, updated_at)
+        VALUES (1, '/staging/orig.mp4', ?, 1000, 'PENDING', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """,
+        (real_hash,),
+    )
+    conn.execute(
+        """
+        INSERT INTO videos (id, source_path, sha256, size_bytes, status, last_error, created_at, updated_at)
+        VALUES (2, '/staging/dup.mp4', ?, 1000, 'SKIPPED', 'Duplicate of /staging/orig.mp4', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """,
+        (fake_dup_hash,),
+    )
+    conn.execute(
+        """
+        INSERT INTO videos (id, source_path, sha256, size_bytes, status, youtube_video_id, actual_privacy, created_at, updated_at)
+        VALUES (3, '/staging/uploaded.mp4', ?, 2000, 'UPLOADED', 'yt_abc_123', 'unlisted', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """,
+        (other_hash,),
+    )
+    conn.execute("INSERT INTO quota_log (date_pacific, units_used, uploads_used) VALUES ('2026-11-07', 3200, 2);")
+    conn.execute("INSERT INTO playlists (name, youtube_playlist_id) VALUES ('My Playlist', 'PL_test');")
+    conn.execute("INSERT INTO playlist_membership (video_id, playlist_name, added, position) VALUES (1, 'My Playlist', 1, 0);")
+    conn.execute("INSERT INTO playlist_membership (video_id, playlist_name, added, position) VALUES (3, 'My Playlist', 1, 1);")
+    conn.commit()
+    conn.close()
+
+    # 2. Run init_db to apply migration 2
+    conn2 = init_db(db_file)
+
+    # Check migration version
+    versions = [r[0] for r in conn2.execute("SELECT version FROM schema_migrations ORDER BY version ASC").fetchall()]
+    assert versions == [1, 2]
+
+    # Verify rows
+    v1 = get_video(conn2, 1)
+    v2 = get_video(conn2, 2)
+    v3 = get_video(conn2, 3)
+
+    assert v1 is not None and v2 is not None and v3 is not None
+    assert v1.source_path == "/staging/orig.mp4"
+    assert v1.sha256 == real_hash
+    assert v1.duplicate_of is None
+    assert v1.status == VideoStatus.PENDING
+
+    # v2 had the fake hash; migration must have restored the real 64-char sha256 and linked duplicate_of
+    assert v2.source_path == "/staging/dup.mp4"
+    assert v2.sha256 == real_hash
+    assert len(v2.sha256) == 64
+    assert v2.duplicate_of == 1
+    assert v2.status == VideoStatus.SKIPPED
+    assert v2.last_error == "Duplicate of /staging/orig.mp4"
+
+    # v3 advanced status preserved
+    assert v3.source_path == "/staging/uploaded.mp4"
+    assert v3.status == VideoStatus.UPLOADED
+    assert v3.youtube_video_id == "yt_abc_123"
+    assert v3.actual_privacy == "unlisted"
+
+    # Verify playlist and playlist_membership preserved (cascade delete was NOT triggered)
+    memberships = get_playlist_memberships(conn2, playlist_name="My Playlist")
+    assert len(memberships) == 2
+    assert {m["video_id"] for m in memberships} == {1, 3}
+
+    # Verify quota_log preserved
+    quota = get_quota_log(conn2, "2026-11-07")
+    assert quota is not None
+    assert quota["units_used"] == 3200
+    assert quota["uploads_used"] == 2
+
+    # Verify new constraints work on migrated table
+    # 1. source_path UNIQUE constraint
+    with pytest.raises(sqlite3.IntegrityError):
+        insert_video(conn2, source_path="/staging/orig.mp4", sha256="distinct_hash", size_bytes=100)
+    # 2. sha256 non-unique allows insertion
+    new_id = insert_video(conn2, source_path="/staging/new_dup.mp4", sha256=real_hash, size_bytes=1000, duplicate_of=1)
+    assert new_id > 0
+    # 3. Status CHECK constraint
+    with pytest.raises(sqlite3.IntegrityError):
+        conn2.execute("INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at) VALUES ('/staging/bad.mp4', 'h', 1, 'INVALID', '2026', '2026')")
+
+    # Idempotent init_db call
+    init_db(conn2)
+    conn2.close()
 
 
 def test_status_check_constraint(memory_db: sqlite3.Connection):

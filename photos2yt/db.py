@@ -127,6 +127,7 @@ class VideoRecord:
     upload_session_uri: Optional[str] = None
     youtube_video_id: Optional[str] = None
     actual_privacy: Optional[str] = None
+    duplicate_of: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row | dict[str, Any]) -> VideoRecord:
@@ -153,10 +154,11 @@ class VideoRecord:
             upload_session_uri=data.get("upload_session_uri"),
             youtube_video_id=data.get("youtube_video_id"),
             actual_privacy=data.get("actual_privacy"),
+            duplicate_of=data.get("duplicate_of"),
         )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 MIGRATIONS: dict[int, list[str]] = {
     1: [
@@ -211,7 +213,77 @@ MIGRATIONS: dict[int, list[str]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_playlist_membership_video ON playlist_membership(video_id);",
         "CREATE INDEX IF NOT EXISTS idx_playlist_membership_playlist ON playlist_membership(playlist_name);",
-    ]
+    ],
+    2: [
+        """
+        CREATE TABLE videos_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path TEXT NOT NULL UNIQUE,
+            sidecar_path TEXT,
+            sha256 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            duration_s REAL,
+            taken_utc TEXT,
+            taken_local_date TEXT,
+            title TEXT,
+            description TEXT,
+            tags_json TEXT,
+            lat REAL,
+            lon REAL,
+            status TEXT NOT NULL CHECK (status IN ('PENDING', 'UPLOADING', 'UPLOADED', 'PLAYLISTED', 'FAILED', 'SKIPPED')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            upload_session_uri TEXT,
+            youtube_video_id TEXT,
+            actual_privacy TEXT,
+            duplicate_of INTEGER REFERENCES videos(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """,
+        """
+        INSERT INTO videos_new (
+            id, source_path, sidecar_path, sha256, size_bytes, duration_s,
+            taken_utc, taken_local_date, title, description, tags_json,
+            lat, lon, status, attempts, last_error, upload_session_uri,
+            youtube_video_id, actual_privacy, duplicate_of, created_at, updated_at
+        )
+        SELECT
+            v.id,
+            v.source_path,
+            v.sidecar_path,
+            CASE WHEN instr(v.sha256, ':dup:') > 0 THEN substr(v.sha256, 1, instr(v.sha256, ':dup:') - 1) ELSE v.sha256 END,
+            v.size_bytes,
+            v.duration_s,
+            v.taken_utc,
+            v.taken_local_date,
+            v.title,
+            v.description,
+            v.tags_json,
+            v.lat,
+            v.lon,
+            v.status,
+            v.attempts,
+            v.last_error,
+            v.upload_session_uri,
+            v.youtube_video_id,
+            v.actual_privacy,
+            CASE WHEN instr(v.sha256, ':dup:') > 0 THEN (
+                SELECT orig.id FROM videos orig
+                WHERE orig.sha256 = substr(v.sha256, 1, instr(v.sha256, ':dup:') - 1)
+                LIMIT 1
+            ) ELSE NULL END,
+            v.created_at,
+            v.updated_at
+        FROM videos v;
+        """,
+        "DROP TABLE videos;",
+        "ALTER TABLE videos_new RENAME TO videos;",
+        "CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);",
+        "CREATE INDEX IF NOT EXISTS idx_videos_taken_utc ON videos(taken_utc);",
+        "CREATE INDEX IF NOT EXISTS idx_videos_sha256 ON videos(sha256);",
+        "CREATE INDEX IF NOT EXISTS idx_videos_duplicate_of ON videos(duplicate_of);",
+    ],
 }
 
 
@@ -239,28 +311,37 @@ def init_db(conn_or_path: sqlite3.Connection | str | Path) -> sqlite3.Connection
     else:
         conn = conn_or_path
 
-    with conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT NOT NULL
-            );
-            """
-        )
+    fk_cursor = conn.execute("PRAGMA foreign_keys;")
+    fk_enabled = bool(fk_cursor.fetchone()[0])
+    if fk_enabled:
+        conn.execute("PRAGMA foreign_keys = OFF;")
 
-        cursor = conn.cursor()
-        cursor.execute("SELECT version FROM schema_migrations ORDER BY version ASC")
-        applied = {row[0] for row in cursor.fetchall()}
+    try:
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+                """
+            )
 
-        for version in sorted(MIGRATIONS.keys()):
-            if version not in applied:
-                for statement in MIGRATIONS[version]:
-                    conn.execute(statement)
-                conn.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                    (version, _iso_now()),
-                )
+            cursor = conn.cursor()
+            cursor.execute("SELECT version FROM schema_migrations ORDER BY version ASC")
+            applied = {row[0] for row in cursor.fetchall()}
+
+            for version in sorted(MIGRATIONS.keys()):
+                if version not in applied:
+                    for statement in MIGRATIONS[version]:
+                        conn.execute(statement)
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                        (version, _iso_now()),
+                    )
+    finally:
+        if fk_enabled:
+            conn.execute("PRAGMA foreign_keys = ON;")
 
     return conn
 
@@ -284,6 +365,7 @@ def insert_video(
     lat: Optional[float] = None,
     lon: Optional[float] = None,
     last_error: Optional[str] = None,
+    duplicate_of: Optional[int] = None,
 ) -> int:
     """Insert a new video record into the queue.
     
@@ -299,8 +381,8 @@ def insert_video(
                 source_path, sidecar_path, sha256, size_bytes, duration_s,
                 taken_utc, taken_local_date, title, description, tags_json,
                 lat, lon, status, attempts, last_error, upload_session_uri,
-                youtube_video_id, actual_privacy, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, NULL, ?, ?)
+                youtube_video_id, actual_privacy, duplicate_of, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, NULL, ?, ?, ?)
             """,
             (
                 source_path,
@@ -317,6 +399,7 @@ def insert_video(
                 lon,
                 status_str,
                 last_error,
+                duplicate_of,
                 now,
                 now,
             ),
@@ -333,13 +416,46 @@ def get_video(conn: sqlite3.Connection, video_id: int) -> Optional[VideoRecord]:
     return VideoRecord.from_row(row)
 
 
-def get_video_by_sha256(conn: sqlite3.Connection, sha256: str) -> Optional[VideoRecord]:
-    """Retrieve a single video record by SHA-256 hash."""
-    cursor = conn.execute("SELECT * FROM videos WHERE sha256 = ?", (sha256,))
+def get_video_by_source_path(conn: sqlite3.Connection, source_path: str) -> Optional[VideoRecord]:
+    """Retrieve a single video record by its source_path."""
+    cursor = conn.execute("SELECT * FROM videos WHERE source_path = ?", (source_path,))
     row = cursor.fetchone()
     if row is None:
         return None
     return VideoRecord.from_row(row)
+
+
+def get_video_by_sha256(conn: sqlite3.Connection, sha256: str) -> Optional[VideoRecord]:
+    """Retrieve a video record by SHA-256 hash, returning the canonical record if duplicates exist."""
+    cursor = conn.execute(
+        "SELECT * FROM videos WHERE sha256 = ? ORDER BY (duplicate_of IS NOT NULL), id ASC LIMIT 1",
+        (sha256,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return VideoRecord.from_row(row)
+
+
+def get_canonical_video_by_sha256(conn: sqlite3.Connection, sha256: str) -> Optional[VideoRecord]:
+    """Retrieve the canonical video record for a given SHA-256 hash."""
+    cursor = conn.execute(
+        "SELECT * FROM videos WHERE sha256 = ? AND duplicate_of IS NULL ORDER BY id ASC LIMIT 1",
+        (sha256,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return VideoRecord.from_row(row)
+
+
+def get_videos_by_sha256(conn: sqlite3.Connection, sha256: str) -> list[VideoRecord]:
+    """Retrieve all video records matching a SHA-256 hash."""
+    cursor = conn.execute(
+        "SELECT * FROM videos WHERE sha256 = ? ORDER BY (duplicate_of IS NOT NULL), id ASC",
+        (sha256,),
+    )
+    return [VideoRecord.from_row(row) for row in cursor.fetchall()]
 
 
 def get_videos_by_status(

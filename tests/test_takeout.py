@@ -233,13 +233,23 @@ def test_full_ingest_synthetic_fixtures(mock_probe, mock_avail, test_config: Con
     assert row_t1["lon"] == pytest.approx(-74.0060)
 
     # 3. Verify duplicate handling in DB
-    # One of the two identical files must be marked SKIPPED with reason
+    # One of the two identical files must be marked SKIPPED with duplicate_of set
     cursor = conn.execute("SELECT * FROM videos WHERE status = 'SKIPPED'")
     skipped_rows = cursor.fetchall()
     assert len(skipped_rows) == 1
     dup_row = skipped_rows[0]
     assert "Duplicate of" in dup_row["last_error"]
     assert "duplicates" in dup_row["source_path"]
+    assert dup_row["duplicate_of"] is not None
+
+    canonical_row = conn.execute("SELECT * FROM videos WHERE id = ?", (dup_row["duplicate_of"],)).fetchone()
+    assert canonical_row is not None
+    assert canonical_row["status"] == "PENDING"
+    assert canonical_row["duplicate_of"] is None
+    assert dup_row["sha256"] == canonical_row["sha256"]
+    assert len(dup_row["sha256"]) == 64
+    assert ":dup:" not in dup_row["sha256"]
+    assert dup_row["last_error"] == f"Duplicate of {canonical_row['source_path']}"
 
     # 4. Verify fallback date source used for missing sidecar
     cursor = conn.execute("SELECT * FROM videos WHERE source_path LIKE '%missing_sidecar_video.mp4'")
@@ -316,16 +326,215 @@ def test_ingest_idempotency_and_preserve_advanced_status(mock_probe, mock_avail,
     conn.close()
 
 
+@patch("photos2yt.takeout.check_ffprobe_available", return_value=True)
+@patch("photos2yt.takeout.probe_video", side_effect=_mock_probe_for_fixtures)
+def test_rerun_ingest_twice_with_duplicates_identical_counts_and_statuses(mock_probe, mock_avail, test_config: Config, tmp_path: Path):
+    """Re-running ingest twice with duplicates present yields identical row counts and statuses."""
+    # First ingest run
+    s1 = ingest(config=test_config, dry_run=False, report_path=tmp_path / "rep1.csv")
+    assert s1.total_scanned == 11
+    assert s1.new_pending == 10
+    assert s1.skipped == 1
+
+    conn = get_connection(test_config.paths.db_path)
+    rows_after_run1 = conn.execute(
+        "SELECT id, source_path, sha256, status, duplicate_of, last_error FROM videos ORDER BY id ASC"
+    ).fetchall()
+    counts_run1 = conn.execute("SELECT status, count(*) FROM videos GROUP BY status ORDER BY status ASC").fetchall()
+    conn.close()
+
+    assert len(rows_after_run1) == 11
+    # Statuses: 10 PENDING, 1 SKIPPED
+    status_dict_1 = {r[0]: r[1] for r in counts_run1}
+    assert status_dict_1 == {"PENDING": 10, "SKIPPED": 1}
+
+    # Second ingest run on exact same directory
+    s2 = ingest(config=test_config, dry_run=False, report_path=tmp_path / "rep2.csv")
+    assert s2.total_scanned == 11
+    assert s2.new_pending == 0
+    assert s2.already_present == 11
+
+    conn = get_connection(test_config.paths.db_path)
+    rows_after_run2 = conn.execute(
+        "SELECT id, source_path, sha256, status, duplicate_of, last_error FROM videos ORDER BY id ASC"
+    ).fetchall()
+    counts_run2 = conn.execute("SELECT status, count(*) FROM videos GROUP BY status ORDER BY status ASC").fetchall()
+    conn.close()
+
+    # Identical row counts and statuses
+    assert len(rows_after_run2) == len(rows_after_run1) == 11
+    assert counts_run2 == counts_run1
+    for r1, r2 in zip(rows_after_run1, rows_after_run2):
+        assert tuple(r1) == tuple(r2)
+
+
+@patch("photos2yt.takeout.check_ffprobe_available", return_value=True)
+def test_deterministic_canonical_choice(mock_avail, tmp_path: Path):
+    """The first path in sorted order keeps the real row (PENDING, duplicate_of=None); later files become SKIPPED."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    # Create 3 video files with identical content
+    content = b"fake identical video bytes"
+    p_z = staging / "z_last.mp4"
+    p_a = staging / "a_first.mp4"
+    p_m = staging / "m_middle.mp4"
+
+    p_z.write_bytes(content)
+    p_a.write_bytes(content)
+    p_m.write_bytes(content)
+
+    cfg = Config(
+        paths=PathsConfig(
+            staging_dir=staging,
+            db_path=tmp_path / "deterministic.db",
+            credentials=tmp_path / "c.json",
+            token=tmp_path / "t.json",
+        ),
+        timezone="America/New_York",
+        youtube=YouTubeConfig(
+            privacy="unlisted",
+            category_id="22",
+            made_for_kids=False,
+            title_template="{title}",
+            default_title="Test",
+        ),
+        quota=QuotaConfig(
+            daily_unit_limit=10000,
+            upload_cost_units=1600,
+            playlist_insert_cost=50,
+            playlist_item_insert_cost=50,
+        ),
+        video_extensions=(".mp4",),
+    )
+
+    with patch("photos2yt.takeout.probe_video", return_value=VideoProbeResult(duration_s=10.0)):
+        summary = ingest(cfg, dry_run=False, report_path=tmp_path / "det_report.csv")
+
+    assert summary.total_scanned == 3
+    assert summary.new_pending == 1
+    assert summary.skipped == 2
+    assert summary.duplicate_count == 2
+
+    conn = get_connection(cfg.paths.db_path)
+    rows = conn.execute(
+        "SELECT id, source_path, sha256, status, duplicate_of, last_error FROM videos ORDER BY source_path ASC"
+    ).fetchall()
+    conn.close()
+
+    assert len(rows) == 3
+    # Sorted order of paths: a_first.mp4, m_middle.mp4, z_last.mp4
+    row_a, row_m, row_z = rows[0], rows[1], rows[2]
+
+    # a_first.mp4 is canonical
+    assert row_a["source_path"] == str(p_a)
+    assert row_a["status"] == "PENDING"
+    assert row_a["duplicate_of"] is None
+    canonical_id = row_a["id"]
+
+    # m_middle.mp4 is duplicate of a_first.mp4
+    assert row_m["source_path"] == str(p_m)
+    assert row_m["status"] == "SKIPPED"
+    assert row_m["duplicate_of"] == canonical_id
+    assert row_m["last_error"] == f"Duplicate of {str(p_a)}"
+
+    # z_last.mp4 is duplicate of a_first.mp4
+    assert row_z["source_path"] == str(p_z)
+    assert row_z["status"] == "SKIPPED"
+    assert row_z["duplicate_of"] == canonical_id
+    assert row_z["last_error"] == f"Duplicate of {str(p_a)}"
+
+    # All share the exact same 64-character sha256
+    assert row_a["sha256"] == row_m["sha256"] == row_z["sha256"]
+    assert len(row_a["sha256"]) == 64
+    assert ":dup:" not in row_a["sha256"]
+
+
+@patch("photos2yt.takeout.check_ffprobe_available", return_value=True)
+def test_duplicate_canonical_file_disappears(mock_avail, tmp_path: Path):
+    """If a previously ingested duplicate's canonical file disappears from disk, do nothing special; keep data consistent."""
+    staging = tmp_path / "disappear_staging"
+    staging.mkdir()
+
+    content = b"sample video bytes duplicate test"
+    p_orig = staging / "1_original.mp4"
+    p_copy = staging / "2_copy.mp4"
+    p_orig.write_bytes(content)
+    p_copy.write_bytes(content)
+
+    cfg = Config(
+        paths=PathsConfig(
+            staging_dir=staging,
+            db_path=tmp_path / "disappear.db",
+            credentials=tmp_path / "c.json",
+            token=tmp_path / "t.json",
+        ),
+        timezone="America/New_York",
+        youtube=YouTubeConfig(
+            privacy="unlisted",
+            category_id="22",
+            made_for_kids=False,
+            title_template="{title}",
+            default_title="Test",
+        ),
+        quota=QuotaConfig(
+            daily_unit_limit=10000,
+            upload_cost_units=1600,
+            playlist_insert_cost=50,
+            playlist_item_insert_cost=50,
+        ),
+        video_extensions=(".mp4",),
+    )
+
+    with patch("photos2yt.takeout.probe_video", return_value=VideoProbeResult(duration_s=15.0)):
+        ingest(cfg, dry_run=False, report_path=tmp_path / "rep1.csv")
+
+    conn = get_connection(cfg.paths.db_path)
+    orig_row = conn.execute("SELECT * FROM videos WHERE source_path = ?", (str(p_orig),)).fetchone()
+    copy_row = conn.execute("SELECT * FROM videos WHERE source_path = ?", (str(p_copy),)).fetchone()
+    assert orig_row["status"] == "PENDING"
+    assert copy_row["status"] == "SKIPPED"
+    assert copy_row["duplicate_of"] == orig_row["id"]
+    conn.close()
+
+    # Canonical file disappears from disk
+    p_orig.unlink()
+
+    # Re-run ingest
+    with patch("photos2yt.takeout.probe_video", return_value=VideoProbeResult(duration_s=15.0)):
+        s2 = ingest(cfg, dry_run=False, report_path=tmp_path / "rep2.csv")
+
+    # Ingest scanned the 1 remaining file and recognized it as already present
+    assert s2.total_scanned == 1
+    assert s2.already_present == 1
+
+    # Database records remain completely consistent
+    conn = get_connection(cfg.paths.db_path)
+    orig_after = conn.execute("SELECT * FROM videos WHERE source_path = ?", (str(p_orig),)).fetchone()
+    copy_after = conn.execute("SELECT * FROM videos WHERE source_path = ?", (str(p_copy),)).fetchone()
+    conn.close()
+
+    assert orig_after is not None
+    assert orig_after["status"] == "PENDING"
+    assert copy_after is not None
+    assert copy_after["status"] == "SKIPPED"
+    assert copy_after["duplicate_of"] == orig_after["id"]
+    assert copy_after["last_error"] == f"Duplicate of {str(p_orig)}"
+
+
 # --- 5. Dry-Run Tests ---
 
 @patch("photos2yt.takeout.check_ffprobe_available", return_value=True)
 @patch("photos2yt.takeout.probe_video", side_effect=_mock_probe_for_fixtures)
 def test_ingest_dry_run_leaves_database_untouched(mock_probe, mock_avail, test_config: Config, tmp_path: Path):
-    """Running ingest with dry_run=True scans, reports, but leaves DB completely empty."""
+    """Running ingest with dry_run=True scans, reports, but leaves DB completely empty (writes nothing)."""
     report_file = tmp_path / "dry_run_report.csv"
     summary = ingest(config=test_config, dry_run=True, report_path=report_file)
 
     assert summary.total_scanned == 11
+    assert summary.new_pending == 10
+    assert summary.duplicate_count == 1
+    assert summary.skipped == 1
     assert report_file.is_file()
 
     # DB file should either not exist or have 0 rows in videos table
@@ -335,6 +544,24 @@ def test_ingest_dry_run_leaves_database_untouched(mock_probe, mock_avail, test_c
         count = cursor.fetchone()[0]
         assert count == 0
         conn.close()
+
+    # Also test running dry_run on an existing populated database writes nothing
+    # 1. Non-dry-run ingest to populate
+    ingest(config=test_config, dry_run=False, report_path=tmp_path / "populated.csv")
+    conn = get_connection(test_config.paths.db_path)
+    count_before = conn.execute("SELECT count(*) FROM videos").fetchone()[0]
+    mtime_before = test_config.paths.db_path.stat().st_mtime
+    conn.close()
+
+    # 2. Dry run against populated database
+    summary2 = ingest(config=test_config, dry_run=True, report_path=tmp_path / "dry_populated.csv")
+    assert summary2.total_scanned == 11
+    assert summary2.already_present == 11
+
+    conn = get_connection(test_config.paths.db_path)
+    count_after = conn.execute("SELECT count(*) FROM videos").fetchone()[0]
+    conn.close()
+    assert count_after == count_before
 
 
 # --- 6. CLI Ingest Command Tests ---

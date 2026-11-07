@@ -15,7 +15,6 @@ import shutil
 import sqlite3
 import subprocess
 from typing import Any, Optional, Sequence
-from uuid import uuid4
 
 from photos2yt.config import Config
 from photos2yt.db import (
@@ -364,7 +363,7 @@ def walk_staging_dir(staging_dir: Path, video_extensions: Sequence[str]) -> list
             if p.suffix.lower() in allowed_exts:
                 results.append(p)
 
-    results.sort()
+    results.sort(key=lambda p: str(p))
     return results
 
 
@@ -466,6 +465,8 @@ def ingest(
         else:
             has_videos_table = _table_exists(conn, "videos")
 
+    dry_run_seen_shas: dict[str, str] = {}
+
     for video_path in video_files:
         size_bytes = video_path.stat().st_size
         sha256 = compute_sha256(video_path)
@@ -537,15 +538,12 @@ def ingest(
         tags_json = json.dumps(tags)
 
         # Check DB state
+        # 1. Look rows up by source_path first so re-running ingest never creates a second row
+        #    for the same file and never resets the status of rows that are past PENDING.
         row_by_path = None
-        existing_by_sha = None
         if has_videos_table:
-            # 1. Existing row by source_path
             cursor = conn.execute("SELECT * FROM videos WHERE source_path = ?", (str(video_path),))
             row_by_path = cursor.fetchone()
-
-            # 2. Existing row by sha256
-            existing_by_sha = get_video_by_sha256(conn, sha256)
 
         item_status = VideoStatus.PENDING.value
         notes: Optional[str] = None
@@ -557,55 +555,76 @@ def ingest(
             summary.already_present += 1
             notes = f"Already in database with status {current_status}"
             # Preserve existing row; do not reset status past PENDING
-        elif existing_by_sha is not None:
-            # A different file path has the exact same SHA-256 hash (Duplicate!)
-            summary.duplicate_count += 1
-            summary.skipped += 1
-            item_status = VideoStatus.SKIPPED.value
-            notes = f"Duplicate of {existing_by_sha.source_path}"
-
-            if not dry_run:
-                # Disambiguate SHA256 in DB to satisfy unique constraint while storing skipped record
-                dup_sha = f"{sha256}:dup:{uuid4().hex[:8]}"
-                insert_video(
-                    conn,
-                    source_path=str(video_path),
-                    sidecar_path=str(sidecar_path) if sidecar_path else None,
-                    sha256=dup_sha,
-                    size_bytes=size_bytes,
-                    duration_s=duration_s,
-                    taken_utc=taken_utc,
-                    taken_local_date=taken_local_date,
-                    title=title,
-                    description=description,
-                    tags_json=tags_json,
-                    lat=lat,
-                    lon=lon,
-                    status=VideoStatus.SKIPPED,
-                    last_error=notes,
-                )
         else:
-            # Brand new unique video
-            summary.new_pending += 1
-            item_status = VideoStatus.PENDING.value
-
-            if not dry_run:
-                insert_video(
-                    conn,
-                    source_path=str(video_path),
-                    sidecar_path=str(sidecar_path) if sidecar_path else None,
-                    sha256=sha256,
-                    size_bytes=size_bytes,
-                    duration_s=duration_s,
-                    taken_utc=taken_utc,
-                    taken_local_date=taken_local_date,
-                    title=title,
-                    description=description,
-                    tags_json=tags_json,
-                    lat=lat,
-                    lon=lon,
-                    status=VideoStatus.PENDING,
+            # 2. Check for duplicate SHA-256 hash among existing videos
+            existing_canonical = None
+            if has_videos_table:
+                cursor = conn.execute(
+                    "SELECT * FROM videos WHERE sha256 = ? ORDER BY (duplicate_of IS NOT NULL), id ASC LIMIT 1",
+                    (sha256,),
                 )
+                existing_canonical = cursor.fetchone()
+
+            if existing_canonical is not None:
+                # A different file path has the exact same SHA-256 hash (Duplicate!)
+                summary.duplicate_count += 1
+                summary.skipped += 1
+                item_status = VideoStatus.SKIPPED.value
+                canonical_path = existing_canonical["source_path"]
+                canonical_id = existing_canonical["id"]
+                notes = f"Duplicate of {canonical_path}"
+
+                if not dry_run:
+                    insert_video(
+                        conn,
+                        source_path=str(video_path),
+                        sidecar_path=str(sidecar_path) if sidecar_path else None,
+                        sha256=sha256,
+                        size_bytes=size_bytes,
+                        duration_s=duration_s,
+                        taken_utc=taken_utc,
+                        taken_local_date=taken_local_date,
+                        title=title,
+                        description=description,
+                        tags_json=tags_json,
+                        lat=lat,
+                        lon=lon,
+                        status=VideoStatus.SKIPPED,
+                        duplicate_of=canonical_id,
+                        last_error=notes,
+                    )
+            elif dry_run and sha256 in dry_run_seen_shas:
+                # In dry-run mode, check if we previously saw this hash earlier in the run
+                summary.duplicate_count += 1
+                summary.skipped += 1
+                item_status = VideoStatus.SKIPPED.value
+                canonical_path = dry_run_seen_shas[sha256]
+                notes = f"Duplicate of {canonical_path}"
+            else:
+                # Brand new canonical unique video
+                if dry_run:
+                    dry_run_seen_shas[sha256] = str(video_path)
+                summary.new_pending += 1
+                item_status = VideoStatus.PENDING.value
+
+                if not dry_run:
+                    insert_video(
+                        conn,
+                        source_path=str(video_path),
+                        sidecar_path=str(sidecar_path) if sidecar_path else None,
+                        sha256=sha256,
+                        size_bytes=size_bytes,
+                        duration_s=duration_s,
+                        taken_utc=taken_utc,
+                        taken_local_date=taken_local_date,
+                        title=title,
+                        description=description,
+                        tags_json=tags_json,
+                        lat=lat,
+                        lon=lon,
+                        status=VideoStatus.PENDING,
+                        duplicate_of=None,
+                    )
 
         if is_long:
             long_note = "Duration exceeds 15 minutes (requires verified YouTube channel)"
