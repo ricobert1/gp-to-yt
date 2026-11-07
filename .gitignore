@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets & local auth
+credentials*.json
+token*.json
+
+# Local databases & run data
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local config & reports
+config.yaml
+ingest_report.csv
+manifest.csv
+
+# macOS
+.DS_Store
