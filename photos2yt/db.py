@@ -158,7 +158,7 @@ class VideoRecord:
         )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MIGRATIONS: dict[int, list[str]] = {
     1: [
@@ -283,6 +283,15 @@ MIGRATIONS: dict[int, list[str]] = {
         "CREATE INDEX IF NOT EXISTS idx_videos_taken_utc ON videos(taken_utc);",
         "CREATE INDEX IF NOT EXISTS idx_videos_sha256 ON videos(sha256);",
         "CREATE INDEX IF NOT EXISTS idx_videos_duplicate_of ON videos(duplicate_of);",
+    ],
+    3: [
+        # Add exhausted_at column to quota_log.
+        # Nullable TEXT stores an ISO-8601 UTC timestamp of when quota was
+        # marked exhausted for that Pacific date.  The migration version guard
+        # in init_db ensures this ALTER runs at most once per database.
+        """
+        ALTER TABLE quota_log ADD COLUMN exhausted_at TEXT;
+        """,
     ],
 }
 
@@ -573,6 +582,30 @@ def upsert_quota_log(
                 uploads_used = uploads_used + excluded.uploads_used
             """,
             (date_pacific, units_used, uploads_used),
+        )
+
+
+def set_quota_exhausted(
+    conn: sqlite3.Connection,
+    date_pacific: str,
+    exhausted_at: Optional[str],
+) -> None:
+    """Set or clear the exhausted_at timestamp on today's quota_log row.
+
+    Ensures the row exists first (via INSERT OR IGNORE), then sets exhausted_at.
+    Pass None to clear the exhausted flag (e.g., after quota resets).
+    """
+    with conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO quota_log (date_pacific, units_used, uploads_used)
+            VALUES (?, 0, 0)
+            """,
+            (date_pacific,),
+        )
+        conn.execute(
+            "UPDATE quota_log SET exhausted_at = ? WHERE date_pacific = ?",
+            (exhausted_at, date_pacific),
         )
 
 

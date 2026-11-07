@@ -242,11 +242,20 @@ def check_authorization(
     config: Config | None = None,
     token_path: Path | str | None = None,
     credentials: Credentials | None = None,
+    conn=None,
 ) -> dict[str, str]:
     """Check authorization by calling channels.list?part=snippet&mine=true (1 quota unit).
 
     Prints only the channel title and ID, and never any secrets or tokens.
-    Records 1 quota unit in quota_log if the quota module is available.
+    Records 1 quota unit in quota_log via quota.record().
+
+    Args:
+        config: Optional Config instance.
+        token_path: Path to token.json (mutually exclusive with credentials).
+        credentials: Pre-built Credentials object (mutually exclusive with token_path).
+        conn: Optional open SQLite connection for quota recording.  If None,
+              a short-lived connection is opened from config.paths.db_path.
+              Pass an in-memory connection in tests.
 
     Returns:
         Dict with 'id' and 'title'.
@@ -277,18 +286,29 @@ def check_authorization(
         print(f"Channel ID: {channel_id}")
         channel_info = {"id": channel_id, "title": channel_title}
 
-    # Record 1 quota unit if quota module is available
+    # Record 1 quota unit for the channels.list call.
+    # Uses a caller-supplied conn (useful in tests) or opens one from config.
     try:
-        from photos2yt import quota
-        if hasattr(quota, "record_usage"):
-            quota.record_usage(config, units=1)
-        elif hasattr(quota, "record"):
-            quota.record(config, units=1)
-        else:
-            # TODO: Record 1 unit in quota_log when quota module (Task 5) is implemented
-            pass
-    except (ImportError, Exception):
-        # TODO: Record 1 unit in quota_log when quota module (Task 5) is implemented
+        from photos2yt.quota import QuotaTracker
+        from photos2yt.db import get_connection, init_db
+
+        _close_conn = False
+        _conn = conn
+        if _conn is None:
+            _cfg = config if config is not None else load_config()
+            _conn = get_connection(_cfg.paths.db_path)
+            init_db(_conn)
+            _close_conn = True
+
+        _cfg = config if config is not None else load_config()
+        try:
+            tracker = QuotaTracker(_conn, _cfg)
+            tracker.record(1)
+        finally:
+            if _close_conn:
+                _conn.close()
+    except Exception:
+        # Quota recording is best-effort; never abort the auth check on failure.
         pass
 
     return channel_info
