@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from photos2yt.auth import AuthError, authenticate, check_authorization
 from photos2yt.config import ConfigError, load_config
 
 
@@ -76,10 +77,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # For other commands, we will load config as well
         config = load_config(args.config_path)
+
+        if args.subcommand == "auth":
+            if args.check:
+                check_authorization(config=config)
+                return 0
+            else:
+                authenticate(config=config, no_browser=args.no_browser)
+                return 0
+
         print(f"Command '{args.subcommand}' not yet implemented. Configuration loaded successfully.")
         return 0
     except ConfigError as err:
         sys.stderr.write(f"Configuration error:\n{err}\n")
+        return 1
+    except AuthError as err:
+        sys.stderr.write(f"Authentication error:\n{err}\n")
         return 1
     except Exception as err:
         sys.stderr.write(f"Unexpected error: {err}\n")
