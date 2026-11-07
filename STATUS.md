@@ -7,9 +7,10 @@
 - Task 4: Takeout ingest (3e871e2), duplicate handling fix (6d80e88)
 - Checkpoint after real-sample verification (6bdf3b1)
 - Task 5: quota tracker (see next commit; migration 3 adds quota_log.exhausted_at)
+- Task 6: uploader (resumable uploads, quota-aware, private-lock read-back check)
 
 ## Next
-- Task 6: uploader (resumable uploads, quota-aware, private-lock read-back check)
+- Task 7: curator (declarative rules for playlists)
 
 ## Known deviations / notes
 - Quota recording in auth check is best-effort (errors swallowed).
