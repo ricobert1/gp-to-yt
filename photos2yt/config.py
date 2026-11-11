@@ -28,6 +28,9 @@ class PathsConfig:
     db_path: Path
     credentials: Path
     token: Path
+    # Playlist rules file for `photos2yt curate`. None = not set in config;
+    # the curator then uses rules.yaml next to the config file.
+    rules: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -91,12 +94,17 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
             if val is None or not str(val).strip():
                 errors.append(f"paths.{field} is required and cannot be empty")
         
+        rules_val = paths_data.get("rules")
+        if rules_val is not None and not str(rules_val).strip():
+            errors.append("paths.rules, if given, cannot be empty")
+
         if not errors:  # If no errors so far in paths, construct PathsConfig
             paths_obj = PathsConfig(
                 staging_dir=_resolve_path(str(paths_data["staging_dir"]), base_dir),
                 db_path=_resolve_path(str(paths_data["db_path"]), base_dir),
                 credentials=_resolve_path(str(paths_data["credentials"]), base_dir),
                 token=_resolve_path(str(paths_data["token"]), base_dir),
+                rules=_resolve_path(str(rules_val), base_dir) if rules_val is not None else None,
             )
 
     # 2. Validate 'timezone'

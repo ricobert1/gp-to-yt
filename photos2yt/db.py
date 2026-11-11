@@ -794,3 +794,37 @@ def mark_playlist_membership_added(
             """,
             (1 if added else 0, video_id, playlist_name),
         )
+
+
+def record_playlist_item_added(
+    conn: sqlite3.Connection,
+    video_id: int,
+    playlist_name: str,
+    position: int,
+) -> None:
+    """Record that a video was inserted into a playlist at ``position``.
+
+    In one transaction: every other added member of the playlist at or after
+    ``position`` moves down by one (mirroring what YouTube does to the
+    playlist), then this video's membership row is upserted with added=1.
+    """
+    with conn:
+        conn.execute(
+            """
+            UPDATE playlist_membership
+            SET position = position + 1
+            WHERE playlist_name = ? AND added = 1 AND video_id != ?
+              AND position IS NOT NULL AND position >= ?
+            """,
+            (playlist_name, video_id, position),
+        )
+        conn.execute(
+            """
+            INSERT INTO playlist_membership (video_id, playlist_name, added, position)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(video_id, playlist_name) DO UPDATE SET
+                added = 1,
+                position = excluded.position
+            """,
+            (video_id, playlist_name, position),
+        )

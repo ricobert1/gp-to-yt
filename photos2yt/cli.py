@@ -63,7 +63,11 @@ def create_parser() -> argparse.ArgumentParser:
 
     # curate command (Task 7)
     curate_parser = subparsers.add_parser("curate", help="Organize uploaded videos into playlists based on rules")
-    curate_parser.add_argument("--dry-run", action="store_true", help="Simulate curation without modifying playlists")
+    curate_parser.add_argument("--dry-run", action="store_true",
+                               help="Print the plan; no API calls, no credentials, database opened read-only")
+    curate_parser.add_argument("--rules", dest="rules_path", default=None,
+                               help="Playlist rules YAML (default: paths.rules from config, "
+                                    "else rules.yaml next to the config file)")
 
     # reconcile command (Task 8)
     subparsers.add_parser("reconcile", help="Reconcile local database with remote YouTube videos")
@@ -157,6 +161,74 @@ def configure_logging() -> None:
     pkg_logger.addHandler(handler)
 
 
+def run_curate_command(
+    config,
+    *,
+    dry_run: bool = False,
+    rules_path: Optional[str] = None,
+    youtube_factory=None,
+    sleep=None,
+) -> int:
+    """Implements `photos2yt curate`. Returns the process exit code.
+
+    --dry-run: no credentials, no API client, and the database is opened
+    read-only (never created or migrated). Otherwise credentials are only
+    loaded if there is an API call to make. Exit code 1 if any add or
+    playlist creation failed (or the rules are invalid), else 0; a clean stop
+    on quota is not a failure.
+    """
+    from photos2yt.curator import (
+        RulesError,
+        build_plan,
+        format_plan,
+        load_rules,
+        resolve_rules_path,
+        run_curation,
+    )
+    from photos2yt.db import get_connection, get_readonly_connection, init_db
+    from photos2yt.quota import QuotaTracker
+
+    path, explicit = resolve_rules_path(config, rules_path)
+    if not path.exists():
+        if explicit:
+            sys.stderr.write(f"Rules file not found: {path}\n")
+            return 1
+        print(f"No rules file at {path}; nothing to curate "
+              "(copy photos2yt/rules.yaml.example there, or set paths.rules).")
+        return 0
+    try:
+        rules = load_rules(path)
+    except RulesError as err:
+        sys.stderr.write(f"Rules error:\n{err}\n")
+        return 1
+
+    if dry_run:
+        try:
+            conn = get_readonly_connection(config.paths.db_path)
+        except FileNotFoundError:
+            print(f"[DRY RUN] No database at {config.paths.db_path}; nothing to curate.")
+            return 0
+        try:
+            plan = build_plan(conn, rules, config=config)
+            print(format_plan(plan, config, QuotaTracker(conn, config)))
+        finally:
+            conn.close()
+        return 0
+
+    if youtube_factory is None:
+        def youtube_factory():
+            creds = get_credentials(config=config)
+            return get_youtube_service(config=config, credentials=creds)
+
+    conn = init_db(get_connection(config.paths.db_path))
+    try:
+        tracker = QuotaTracker(conn, config)
+        summary = run_curation(conn, config, tracker, youtube_factory, rules, sleep=sleep)
+    finally:
+        conn.close()
+    return 1 if summary.failed else 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     configure_logging()
     parser = create_parser()
@@ -204,6 +276,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.subcommand == "upload":
             return run_upload_command(config, limit=args.limit, dry_run=args.dry_run, wait=args.wait)
+
+        if args.subcommand == "curate":
+            return run_curate_command(config, dry_run=args.dry_run, rules_path=args.rules_path)
 
         print(f"Command '{args.subcommand}' not yet implemented. Configuration loaded successfully.")
         return 0

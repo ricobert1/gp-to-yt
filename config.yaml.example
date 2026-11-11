@@ -3,6 +3,7 @@ paths:
   db_path: queue.db
   credentials: credentials.json
   token: token.json
+  rules: rules.yaml               # playlist rules for `curate` (default: rules.yaml next to this file)
 timezone: America/New_York        # local-date rule for recordingDate / playlist rules
 youtube:
   privacy: unlisted               # requested; actual may be private (see fact 1)
