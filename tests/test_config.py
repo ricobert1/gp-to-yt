@@ -241,3 +241,65 @@ def test_cli_no_args_prints_help(capsys):
     captured = capsys.readouterr()
     assert "photos2yt" in captured.out
     assert "Google Photos to YouTube Migration" in captured.out
+
+
+# --- youtube.upload_chunk_size (Task 6) ---
+
+def _raw_with_youtube(**youtube_extra):
+    youtube = {
+        "privacy": "unlisted",
+        "category_id": "22",
+        "made_for_kids": False,
+        "title_template": "{date} - {title}",
+        "default_title": "Family Video",
+    }
+    youtube.update(youtube_extra)
+    return {
+        "paths": {
+            "staging_dir": "/staging",
+            "db_path": "queue.db",
+            "credentials": "credentials.json",
+            "token": "token.json",
+        },
+        "timezone": "America/New_York",
+        "youtube": youtube,
+        "quota": {
+            "daily_unit_limit": 10000,
+            "upload_cost_units": 1600,
+            "playlist_insert_cost": 50,
+            "playlist_item_insert_cost": 50,
+        },
+        "video_extensions": [".mp4"],
+    }
+
+
+def test_upload_chunk_size_defaults_to_8_mib():
+    cfg = validate_and_parse_config(_raw_with_youtube())
+    assert cfg.youtube.upload_chunk_size == 8 * 1024 * 1024
+
+
+def test_example_config_sets_upload_chunk_size():
+    example_path = Path(__file__).parent.parent / "config.yaml.example"
+    assert load_config(example_path).youtube.upload_chunk_size == 8 * 1024 * 1024
+
+
+def test_upload_chunk_size_custom_value():
+    cfg = validate_and_parse_config(_raw_with_youtube(upload_chunk_size=256 * 1024 * 4))
+    assert cfg.youtube.upload_chunk_size == 1024 * 1024
+
+
+@pytest.mark.parametrize("bad", [0, -262144, 1000, 262145, "8MiB", True, 1.5])
+def test_upload_chunk_size_invalid(bad):
+    with pytest.raises(ConfigError, match="youtube.upload_chunk_size"):
+        validate_and_parse_config(_raw_with_youtube(upload_chunk_size=bad))
+
+
+def test_channel_verified_defaults_false_and_parses():
+    assert validate_and_parse_config(_raw_with_youtube()).youtube.channel_verified is False
+    cfg = validate_and_parse_config(_raw_with_youtube(channel_verified=True))
+    assert cfg.youtube.channel_verified is True
+
+
+def test_channel_verified_must_be_bool():
+    with pytest.raises(ConfigError, match="youtube.channel_verified"):
+        validate_and_parse_config(_raw_with_youtube(channel_verified="yes"))

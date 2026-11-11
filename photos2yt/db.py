@@ -588,6 +588,71 @@ def update_upload_session(
         )
 
 
+def update_video_verification(
+    conn: sqlite3.Connection,
+    video_id: int,
+    *,
+    actual_privacy: Optional[str],
+) -> VideoRecord:
+    """Store the post-upload read-back result (actual privacy) without changing status.
+
+    Only valid for videos that have been uploaded (UPLOADED or PLAYLISTED).
+
+    Raises:
+        VideoNotFoundError: If no video with video_id exists.
+        DatabaseError: If the video has not been uploaded.
+    """
+    with conn:
+        row = conn.execute(
+            "SELECT status FROM videos WHERE id = ?", (video_id,)
+        ).fetchone()
+        if row is None:
+            raise VideoNotFoundError(f"Video with id {video_id} not found")
+        if row["status"] not in (VideoStatus.UPLOADED.value, VideoStatus.PLAYLISTED.value):
+            raise DatabaseError(
+                f"Cannot store verification for video {video_id}: status is {row['status']}"
+            )
+        conn.execute(
+            "UPDATE videos SET actual_privacy = ?, updated_at = ? WHERE id = ?",
+            (actual_privacy, _iso_now(), video_id),
+        )
+        updated = conn.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
+        return VideoRecord.from_row(updated)
+
+
+def get_video_by_youtube_id(
+    conn: sqlite3.Connection, youtube_video_id: str
+) -> Optional[VideoRecord]:
+    """Retrieve the video record that holds a given YouTube video id, if any."""
+    row = conn.execute(
+        "SELECT * FROM videos WHERE youtube_video_id = ? ORDER BY id ASC LIMIT 1",
+        (youtube_video_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return VideoRecord.from_row(row)
+
+
+def get_readonly_connection(db_path: str | Path) -> sqlite3.Connection:
+    """Open an existing database strictly read-only (never creates or migrates it).
+
+    Used by --dry-run. Raises FileNotFoundError if the database file does not exist.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Database not found: {path}")
+    # Even mode=ro creates -wal/-shm side files for a WAL database. When no WAL
+    # file exists (the normal state after a clean close) everything is in the
+    # main file, so open it immutable: SQLite then creates no files at all.
+    # If a -wal file is present, it holds data not yet checkpointed, so use
+    # plain read-only mode to see it (its side files already exist).
+    wal = path.with_name(path.name + "-wal")
+    flags = "mode=ro" if wal.exists() else "mode=ro&immutable=1"
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?{flags}", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 # --- Quota Helpers ---
 
 def get_quota_log(conn: sqlite3.Connection, date_pacific: str) -> Optional[sqlite3.Row]:

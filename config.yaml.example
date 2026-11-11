@@ -10,6 +10,8 @@ youtube:
   made_for_kids: false
   title_template: "{date} - {title}"
   default_title: "Family Video"
+  upload_chunk_size: 8388608       # bytes; resumable chunk, multiple of 262144 (256 KiB)
+  channel_verified: false         # required for videos > 15 min
 quota:
   daily_unit_limit: 10000
   upload_cost_units: 1600         # VERIFY against Google's current table
