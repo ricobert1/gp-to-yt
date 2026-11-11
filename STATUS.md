@@ -19,8 +19,6 @@
 - Manual: upload one real short file (`photos2yt upload --limit 1`), check the
   private-lock warning and recordingDate check against reality.
 - Task 7B / Task 8 (not started, per instructions).
-- Clean up stray files committed by an earlier aider session: `File: photos2yt/uploader.py`,
-  `path/to/filename.js`, `queue.db-shm`.
 
 ## How the uploader behaves (Task 6)
 - Run order: recover rows stuck in UPLOADING, then upload PENDING rows by (taken_utc, id).
