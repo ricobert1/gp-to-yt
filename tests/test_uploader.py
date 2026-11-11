@@ -1136,6 +1136,36 @@ def test_same_timestamp_ordered_by_id(conn, config, tracker, make_video):
     assert get_video(conn, first.id).status == VideoStatus.UPLOADED
 
 
+def test_largest_first_is_the_default_order(conn, config, tracker, make_video):
+    small = make_video(title="small", size_bytes=1_000, taken_utc="2019-01-01T00:00:00Z")
+    big = make_video(title="big", size_bytes=9_000, taken_utc="2023-01-01T00:00:00Z")
+    mid = make_video(title="mid", size_bytes=5_000, taken_utc="2021-01-01T00:00:00Z")
+    yt = make_api(success_requests(2))
+    run_uploads(conn, config, tracker, yt, limit=2, out=Out(), retry_sleep=no_sleep)
+    assert get_video(conn, big.id).youtube_video_id == "yt-0"
+    assert get_video(conn, mid.id).youtube_video_id == "yt-1"
+    assert get_video(conn, small.id).status == VideoStatus.PENDING
+
+
+def test_equal_sizes_fall_back_to_date_order(conn, config, tracker, make_video):
+    late = make_video(title="late", size_bytes=5_000, taken_utc="2023-01-01T00:00:00Z")
+    early = make_video(title="early", size_bytes=5_000, taken_utc="2020-01-01T00:00:00Z")
+    yt = make_api(success_requests(1))
+    run_uploads(conn, config, tracker, yt, limit=1, out=Out(), retry_sleep=no_sleep)
+    assert get_video(conn, early.id).status == VideoStatus.UPLOADED
+    assert get_video(conn, late.id).status == VideoStatus.PENDING
+
+
+def test_oldest_first_order(conn, config, tracker, make_video):
+    cfg = replace(config, youtube=replace(config.youtube, upload_order="oldest_first"))
+    big = make_video(title="big", size_bytes=9_000, taken_utc="2023-01-01T00:00:00Z")
+    old = make_video(title="old", size_bytes=1_000, taken_utc="2019-01-01T00:00:00Z")
+    yt = make_api(success_requests(1))
+    run_uploads(conn, cfg, tracker, yt, limit=1, out=Out(), retry_sleep=no_sleep)
+    assert get_video(conn, old.id).status == VideoStatus.UPLOADED
+    assert get_video(conn, big.id).status == VideoStatus.PENDING
+
+
 def test_over_15_minutes_skipped(conn, config, tracker, make_video):
     long_v = make_video(title="Long", duration_s=MAX_UNVERIFIED_DURATION_S + 1)
     ok = make_video(title="Exactly 15", duration_s=MAX_UNVERIFIED_DURATION_S)
@@ -1319,6 +1349,16 @@ def test_dry_run_respects_limit(config, video_file):
     file_conn.close()
     plan = dry_run(config, limit=1, out=Out())
     assert [v.title for v in plan.to_upload] == ["T0"]
+
+
+def test_dry_run_lists_largest_first(config, video_file):
+    file_conn = init_db(get_connection(config.paths.db_path))
+    for i, size in enumerate([10, 30, 20]):
+        insert_video(file_conn, source_path=f"{video_file}{i}", sha256=f"s{i}",
+                     size_bytes=size, title=f"T{size}")
+    file_conn.close()
+    plan = dry_run(config, out=Out())
+    assert [v.title for v in plan.to_upload] == ["T30", "T20", "T10"]
 
 
 def _write_config(tmp_path: Path) -> Path:

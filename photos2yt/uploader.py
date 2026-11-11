@@ -833,7 +833,8 @@ def run_uploads(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     retry_sleep: Callable[[float], None] = time.sleep,
 ) -> RunSummary:
-    """Recover interrupted uploads, then upload PENDING rows in (taken_utc, id) order.
+    """Recover interrupted uploads, then upload PENDING rows in upload order
+    (youtube.upload_order: largest file first, or (taken_utc, id)).
 
     ``sleep`` is used only for --wait (sleeping until the quota reset);
     ``retry_sleep`` is the backoff sleep between chunk retries.
@@ -854,7 +855,7 @@ def run_uploads(
         return summary
 
     attempted = 0
-    for video in get_videos_by_status(conn, VideoStatus.PENDING):
+    for video in _pending_in_upload_order(conn, config):
         if limit is not None and attempted >= limit:
             break
 
@@ -933,6 +934,12 @@ class DryRunPlan:
     database_missing: bool = False
 
 
+def _pending_in_upload_order(conn, config: Config) -> list[VideoRecord]:
+    """PENDING rows in the order uploads (and the dry run) take them."""
+    largest = getattr(config.youtube, "upload_order", "largest_first") == "largest_first"
+    return get_videos_by_status(conn, VideoStatus.PENDING, largest_first=largest)
+
+
 def dry_run(config: Config, *, limit: Optional[int] = None, out: Printer = print) -> DryRunPlan:
     """Print what an upload run would do. Touches neither the API nor the database
     (opens it read-only; never creates a missing database file)."""
@@ -947,7 +954,7 @@ def dry_run(config: Config, *, limit: Optional[int] = None, out: Printer = print
 
     try:
         plan.interrupted = len(get_videos_by_status(conn, VideoStatus.UPLOADING))
-        for video in get_videos_by_status(conn, VideoStatus.PENDING):
+        for video in _pending_in_upload_order(conn, config):
             if _too_long(video, config):
                 plan.to_skip.append(video)
                 continue
@@ -960,11 +967,12 @@ def dry_run(config: Config, *, limit: Optional[int] = None, out: Printer = print
     per_video = config.quota.upload_cost_units + VERIFY_COST_UNITS
     plan.estimated_units = per_video * len(plan.to_upload)
 
+    order = getattr(config.youtube, "upload_order", "largest_first").replace("_", " ")
     out(f"[DRY RUN] Would upload {len(plan.to_upload)} video(s), requested privacy "
-        f"'{config.youtube.privacy}'.")
+        f"'{config.youtube.privacy}', order: {order}.")
     for video in plan.to_upload:
         title = build_request_body(video, config)["snippet"]["title"]
-        out(f"  - row {video.id}: {title}")
+        out(f"  - row {video.id} ({video.size_bytes / 1_000_000:.1f} MB): {title}")
     for video in plan.to_skip:
         out(f"  - would SKIP row {video.id} ({video.title}): longer than 15 min, channel not verified")
     if plan.interrupted:
