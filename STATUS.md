@@ -166,9 +166,8 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
   marked `extra={ECHOED_TO_TERMINAL: True}` (set by `_warn`), so echoed warnings show
   once and log-only warnings (e.g. tenacity retry notices) still reach the terminal once.
   Records still propagate to any logging the user configures.
-- The task said curator.py's `_Runner._fail` also does logger.error plus out; the curator
-  in this repository has no logger, `_Runner` or `_fail` (it only prints), so nothing to
-  change there. If that code lands later, mark its log records with ECHOED_TO_TERMINAL too.
+- curator.py `_Runner._fail` had the same double print (logger.error + out); its log record
+  is now marked ECHOED_TO_TERMINAL too.
 - `--wait` applies to the local can_afford check only; a quotaExceeded from YouTube still
   stops the run (as specified), it does not sleep.
 - An unexpected exception in the middle of an upload leaves the row UPLOADING; the next

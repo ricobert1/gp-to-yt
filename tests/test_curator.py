@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -617,6 +618,42 @@ def test_playlist_create_failure_skips_only_that_playlist(conn, config, tracker,
     run(conn, config, tracker, yt2, rules)
     assert [c[0] for c in yt2.calls] == ["playlists.insert", "playlistItems.insert"]
     assert record(conn, v).status.value == "PLAYLISTED"
+
+
+def test_failure_shown_once_on_terminal_but_still_logged(conn, config, tracker, tmp_path, capsys):
+    """_Runner._fail prints via out and logs; the log record must not be
+    printed a second time on stderr (by logging.lastResort when no logging is
+    configured, or by the CLI's stderr handler)."""
+    add_video(conn, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25",
+              title="Christmas tree")
+    rules = xmas_rules(tmp_path)
+    root = logging.getLogger()
+    pkg = logging.getLogger("photos2yt")
+    saved_root, saved_pkg = root.handlers[:], pkg.handlers[:]
+    seen: list[str] = []
+
+    class Recorder(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    for with_cli_logging in (False, True):
+        root.handlers = []  # pytest's own root handlers would hide lastResort
+        pkg.handlers = [h for h in saved_pkg if isinstance(h, logging.NullHandler)]
+        try:
+            if with_cli_logging:
+                cli.configure_logging()
+                root.addHandler(Recorder())
+            yt = FakeYouTube()
+            yt.playlist_script = [http_error(400, "invalidPlaylistSnippet")]
+            summary = run_curation(conn, config, tracker, Factory(yt), rules, out=print,
+                                   sleep=lambda s: None)
+            captured = capsys.readouterr()
+        finally:
+            root.handlers, pkg.handlers = saved_root, saved_pkg
+        assert summary.failed == 1
+        assert captured.out.count("could not create playlist") == 1
+        assert "could not create playlist" not in captured.err
+    assert sum("could not create playlist" in m for m in seen) == 1
 
 
 def test_playlist_not_found_skips_rest_of_that_playlist(conn, config, tracker, tmp_path):

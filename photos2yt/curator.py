@@ -51,6 +51,7 @@ import yaml
 from googleapiclient.errors import HttpError
 from tenacity import RetryError, Retrying, retry_if_exception, stop_after_attempt
 
+from photos2yt import ECHOED_TO_TERMINAL
 from photos2yt.config import Config
 from photos2yt.db import (
     VideoRecord,
@@ -571,7 +572,7 @@ class _Runner:
     def _fail(self, message: str) -> None:
         self.summary.failed += 1
         self.summary.errors.append(message)
-        logger.error(message)
+        logger.error(message, extra={ECHOED_TO_TERMINAL: True})  # already printed below
         self.out(f"  FAILED: {message}")
 
     def ensure_playlist(self, rule: PlaylistRule) -> Optional[str]:
