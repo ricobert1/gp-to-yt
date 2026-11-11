@@ -837,3 +837,10 @@ def test_cli_real_run_failure_exit_code(tmp_path):
     yt.playlist_script = [http_error(400, "invalidPlaylistSnippet")]
     assert cli.run_curate_command(load_config(cfg), youtube_factory=Factory(yt),
                                   sleep=lambda s: None) == 1
+
+
+def test_format_plan_without_rules_says_no_rules(conn, config):
+    from photos2yt.curator import format_plan
+    text = format_plan(build_plan(conn, {}, config=config), config)
+    assert "no playlist rules are configured" in text
+    assert "every matching video" not in text

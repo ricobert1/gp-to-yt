@@ -853,3 +853,40 @@ def update_video_title(conn: sqlite3.Connection, video_id: int, title: str) -> b
             (title, _iso_now(), video_id, *RETITLABLE_STATUSES, title),
         )
     return cur.rowcount == 1
+
+
+# --- Reconcile notes (Task 8) ---
+
+# last_error on an UPLOADED/PLAYLISTED row is reused for problems found by
+# `photos2yt reconcile` (missing on YouTube, recordingDate not right). Notes
+# start with this prefix so a later clean reconcile clears only its own note.
+RECONCILE_NOTE_PREFIX = "[reconcile"
+
+
+def set_reconcile_note(conn: sqlite3.Connection, video_id: int, note: Optional[str]) -> bool:
+    """Store (or clear, when ``note`` is None) a reconcile note in last_error.
+
+    Never changes status. Only rows that are UPLOADED or PLAYLISTED are
+    touched. Clearing removes last_error only if it is a reconcile note.
+    Returns True if the row changed.
+    """
+    with conn:
+        if note is None:
+            cur = conn.execute(
+                """
+                UPDATE videos SET last_error = NULL, updated_at = ?
+                WHERE id = ? AND status IN ('UPLOADED', 'PLAYLISTED')
+                  AND last_error LIKE ? || '%'
+                """,
+                (_iso_now(), video_id, RECONCILE_NOTE_PREFIX),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE videos SET last_error = ?, updated_at = ?
+                WHERE id = ? AND status IN ('UPLOADED', 'PLAYLISTED')
+                  AND (last_error IS NULL OR last_error != ?)
+                """,
+                (note, _iso_now(), video_id, note),
+            )
+    return cur.rowcount == 1
