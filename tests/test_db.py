@@ -582,24 +582,28 @@ def test_playlist_membership_update_added(memory_db: sqlite3.Connection):
 # --- update_upload_session (added for Task 6) ---
 
 def test_update_upload_session_sets_uri_only_while_uploading():
-    from photos2yt.db import DatabaseError, update_upload_session
+    from photos2yt.db import update_upload_session
 
     conn = init_db(get_connection(":memory:"))
     vid = insert_video(conn, source_path="/a.mp4", sha256="h1", size_bytes=1)
 
-    with pytest.raises(DatabaseError):
-        update_upload_session(conn, vid, "https://example/session")
+    # Not UPLOADING: no-op.
+    update_upload_session(conn, vid, "https://example/session")
     assert get_video(conn, vid).upload_session_uri is None
 
     transition_video_status(conn, vid, VideoStatus.UPLOADING)
-    rec = update_upload_session(conn, vid, "https://example/session")
+    update_upload_session(conn, vid, "https://example/session")
+    rec = get_video(conn, vid)
     assert rec.upload_session_uri == "https://example/session"
     assert rec.status == VideoStatus.UPLOADING
-    assert get_video(conn, vid).upload_session_uri == "https://example/session"
+
+    # None clears it.
+    update_upload_session(conn, vid, None)
+    assert get_video(conn, vid).upload_session_uri is None
 
 
 def test_update_upload_session_missing_video():
-    from photos2yt.db import VideoNotFoundError, update_upload_session
+    from photos2yt.db import update_upload_session
 
     conn = init_db(get_connection(":memory:"))
     with pytest.raises(VideoNotFoundError):

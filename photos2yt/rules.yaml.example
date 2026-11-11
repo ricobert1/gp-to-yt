@@ -1,0 +1,27 @@
+# photos2yt curation rules
+#
+# Declarative playlist rules for organizing uploaded videos.
+# The curator evaluates each UPLOADED or PLAYLISTED video against these rules
+# and produces a plan: which playlists to create, and in what order to add members.
+#
+# Conditions are evaluated against the local date derived from taken_local_date
+# (NOT UTC). A video taken at 8 PM Eastern on Dec 24 will have taken_local_date = "Dec 24"
+# and must NOT match a rule requiring local_month=12, local_day=25.
+#
+# Supported conditions:
+#   - local_month: integer month (1-12)
+#   - local_day: integer day of month (1-31)
+#   - local_year: integer year
+#   - title_contains_any: list of keywords (case-insensitive whole-word match)
+#   - tags_contain_any: list of keyword tags (case-insensitive whole-word match)
+#
+# Example:
+#   playlists:
+#     - name: "Christmas Day Through the Years"
+#       privacy: unlisted
+#       match:
+#         any:
+#           - {local_month: 12, local_day: 25}
+#           - {tags_contain_any: ["Christmas Day"]}
+
+playlists: []

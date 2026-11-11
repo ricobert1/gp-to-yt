@@ -1,0 +1,20 @@
+paths:
+  staging_dir: /path/to/takeout/Google Photos
+  db_path: queue.db
+  credentials: credentials.json
+  token: token.json
+timezone: America/New_York        # local-date rule for recordingDate / playlist rules
+youtube:
+  privacy: unlisted               # requested; actual may be private (see fact 1)
+  category_id: "22"
+  made_for_kids: false
+  title_template: "{date} - {title}"
+  default_title: "Family Video"
+  channel_verified: false         # required for videos > 15 min
+quota:
+  daily_unit_limit: 10000
+  upload_cost_units: 1600         # VERIFY against Google's current table
+  playlist_insert_cost: 50
+  playlist_item_insert_cost: 50
+  daily_upload_limit: null        # set if Google uses a separate upload bucket
+video_extensions: [.mp4, .mov, .mkv, .m4v, .avi, .3gp]

@@ -556,36 +556,36 @@ def transition_video_status(
 def update_upload_session(
     conn: sqlite3.Connection,
     video_id: int,
-    upload_session_uri: str,
-) -> VideoRecord:
-    """Persist the resumable upload session URI for a video that is UPLOADING.
+    session_uri: Optional[str],
+) -> None:
+    """Persist (or clear, when ``session_uri`` is None) the resumable upload
+    session URI for a video.
 
-    This does not change status (UPLOADING -> UPLOADING is not a transition);
-    it only records the session URI mid-upload so a crash can resume later.
+    The resumable upload protocol returns the session URI (Location header)
+    as soon as the upload session is created.  Persisting it lets a crashed
+    or interrupted run resume the transfer instead of starting over.
+
+    Only rows currently in UPLOADING status are touched; other statuses are
+    left alone (the session URI is owned by the upload lifecycle and is
+    cleared explicitly on completion or failure via transition_video_status).
+    The URI itself is never logged.
 
     Raises:
         VideoNotFoundError: If no video with video_id exists.
-        DatabaseError: If the video is not currently UPLOADING.
     """
     with conn:
-        row = conn.execute(
-            "SELECT status FROM videos WHERE id = ?", (video_id,)
-        ).fetchone()
-        if row is None:
+        cursor = conn.execute("SELECT id FROM videos WHERE id = ?", (video_id,))
+        if cursor.fetchone() is None:
             raise VideoNotFoundError(f"Video with id {video_id} not found")
-        if row["status"] != VideoStatus.UPLOADING.value:
-            raise DatabaseError(
-                f"Cannot set upload session for video {video_id}: "
-                f"status is {row['status']}, expected UPLOADING"
-            )
+
         conn.execute(
-            "UPDATE videos SET upload_session_uri = ?, updated_at = ? WHERE id = ?",
-            (upload_session_uri, _iso_now(), video_id),
+            """
+            UPDATE videos
+            SET upload_session_uri = ?, updated_at = ?
+            WHERE id = ? AND status = 'UPLOADING'
+            """,
+            (session_uri, _iso_now(), video_id),
         )
-        updated_row = conn.execute(
-            "SELECT * FROM videos WHERE id = ?", (video_id,)
-        ).fetchone()
-        return VideoRecord.from_row(updated_row)
 
 
 # --- Quota Helpers ---
