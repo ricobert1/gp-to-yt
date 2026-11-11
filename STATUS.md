@@ -127,8 +127,9 @@
   a `--limit` slot.
 - Verification after each upload: `videos.list(part=status,processingDetails,recordingDetails)`
   (1 unit, recorded). actual_privacy stored via db.update_video_verification. A privacy
-  mismatch prints and logs a "PRIVATE-UPLOAD LOCK" banner; a missing or different
-  recordingDate prints a warning. Verification failures only warn; the row stays UPLOADED.
+  mismatch prints and logs a "PRIVATE-UPLOAD LOCK" banner; a different recordingDate, or
+  one still missing after processingStatus is "succeeded", prints a warning (a missing one
+  while the video is still processing only prints an info line, see notes). Verification failures only warn; the row stays UPLOADED.
 - `--dry-run`: no credentials, no API client, no DB writes. The DB is opened read-only (and
   `immutable` when there is no -wal file, so not even -wal/-shm files appear); a missing DB
   is not created. Prints count, titles, requested privacy, skips and estimated units
@@ -178,6 +179,25 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
   completes. Adopted videos record only the list calls, not an upload cost (the insert was
   charged on an earlier day/run and was never recorded).
 - recordingDate check compares the UTC date only, because YouTube may drop the time part.
+- recordingDate missing right after upload (fix after the first real uploads, 2026-11-11):
+  for 1 of 3 uploads verify_upload warned "did not stick (missing)" although YouTube Studio
+  showed the correct date. While the video is still processing, recordingDetails can be
+  absent from videos.list. Now: if recordingDate is missing AND processingStatus is not
+  "succeeded" (or absent), print an info line ("not visible yet (video still processing)")
+  and set VerificationResult.recording_date_pending; no "did not stick" warning. Chosen
+  over a delayed re-check because it costs no extra quota (a re-check would be 1 more unit
+  per upload and processing can take longer than any short wait). A recordingDate that
+  *differs* still warns, as does one missing after processing succeeded. Nothing re-checks
+  these yet; a future reconcile step (videos.list, 1 unit) could.
+- Warnings printed twice (fixed): `_warn` prints via `out` and logs; with no logging
+  configured, Python's logging.lastResort also wrote the record to stderr. The `photos2yt`
+  package logger now has a NullHandler (no lastResort). `photos2yt` CLI main() installs one
+  stderr handler (WARNING+, `LEVEL: message`) on the `photos2yt` logger that skips records
+  marked `extra={ECHOED_TO_TERMINAL: True}` (set by `_warn`), so echoed warnings show
+  once and log-only warnings (e.g. tenacity retry notices) still reach the terminal once.
+  Records still propagate to any logging the user configures.
+- curator.py `_Runner._fail` had the same double print (logger.error + out); its log record
+  is now marked ECHOED_TO_TERMINAL too.
 - `--wait` applies to the local can_afford check only; a quotaExceeded from YouTube still
   stops the run (as specified), it does not sleep.
 - An unexpected exception in the middle of an upload leaves the row UPLOADING; the next

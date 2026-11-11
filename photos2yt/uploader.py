@@ -47,6 +47,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from photos2yt import ECHOED_TO_TERMINAL
 from photos2yt.config import Config
 from photos2yt.db import (
     VideoRecord,
@@ -517,12 +518,16 @@ class VerificationResult:
     actual_privacy: Optional[str] = None
     privacy_mismatch: bool = False
     recording_date_problem: Optional[str] = None
+    # recordingDate absent while the video is still processing (not a problem).
+    recording_date_pending: bool = False
     error: Optional[str] = None
 
 
 def _warn(out: Printer, message: str) -> None:
+    """Print a warning once and log it; the record is marked as already printed
+    so the CLI's stderr log handler does not show it a second time."""
     out(message)
-    logger.warning(message)
+    logger.warning(message, extra={ECHOED_TO_TERMINAL: True})
 
 
 def verify_upload(
@@ -582,10 +587,22 @@ def verify_upload(
             bar,
         ]))
 
+    processing = (item.get("processingDetails") or {}).get("processingStatus")
     expected_date = _format_recording_date(video.taken_utc)
     actual_date = (item.get("recordingDetails") or {}).get("recordingDate")
     if expected_date:
-        if not actual_date:
+        if not actual_date and processing != "succeeded":
+            # Right after upload, while YouTube is still processing the video,
+            # recordingDetails can be absent even though the date was stored
+            # (seen on a real upload, 2026-11-11). Not a failure; no extra
+            # videos.list call is spent re-checking.
+            result.recording_date_pending = True
+            message = (f"recordingDate for video {video.youtube_video_id} (row {video.id}) "
+                       f"not visible yet (video still processing: "
+                       f"{processing or 'status unknown'}); check it later in YouTube Studio.")
+            out(message)
+            logger.info(message, extra={ECHOED_TO_TERMINAL: True})
+        elif not actual_date:
             result.recording_date_problem = "missing"
         else:
             normalized = _format_recording_date(actual_date) or actual_date
@@ -596,7 +613,6 @@ def verify_upload(
             _warn(out, f"WARNING: recordingDate for video {video.youtube_video_id} (row {video.id}) "
                        f"did not stick ({result.recording_date_problem}).")
 
-    processing = (item.get("processingDetails") or {}).get("processingStatus")
     if processing:
         logger.info("Video %s: processingStatus=%s", video.id, processing)
     return result

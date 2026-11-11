@@ -668,11 +668,12 @@ def test_default_title_and_privacy_from_config(conn, tracker, make_video, config
 # Part 2: verification, crash recovery, run loop, dry run, CLI
 # ===========================================================================
 
-def verify_response(vid, privacy="unlisted", recording_date="2024-12-25T01:00:00Z"):
+def verify_response(vid, privacy="unlisted", recording_date="2024-12-25T01:00:00Z",
+                    processing="processing"):
     item = {
         "id": vid,
         "status": {"privacyStatus": privacy},
-        "processingDetails": {"processingStatus": "processing"},
+        "processingDetails": {"processingStatus": processing},
         "recordingDetails": {},
     }
     if recording_date is not None:
@@ -818,18 +819,141 @@ def test_verification_video_not_returned_leaves_row_uploaded(conn, config, track
     assert get_video(conn, video.id).status == VideoStatus.UPLOADED
 
 
+@pytest.mark.parametrize("processing", ["processing", "succeeded"])
 @pytest.mark.parametrize(
     "returned,problem",
-    [(None, True), ("2023-01-01T00:00:00Z", True), ("2024-12-25T00:00:00Z", False),
+    [("2023-01-01T00:00:00Z", True), ("2024-12-25T00:00:00Z", False),
      ("2024-12-25T01:00:00Z", False)],
 )
-def test_recording_date_warning(conn, config, tracker, make_video, returned, problem):
+def test_recording_date_warning(conn, config, tracker, make_video, returned, problem, processing):
     video = make_uploaded(conn, make_video)
     out = Out()
-    yt = make_api(verify=lambda vid: verify_response(vid, recording_date=returned))
+    yt = make_api(verify=lambda vid: verify_response(vid, recording_date=returned,
+                                                     processing=processing))
     result = verify_upload(conn, config, tracker, yt, video, out=out)
     assert (result.recording_date_problem is not None) is problem
-    assert ("recordingDate" in out.text) is problem
+    assert ("did not stick" in out.text) is problem
+    assert result.recording_date_pending is False
+
+
+@pytest.mark.parametrize("processing", ["processing", "uploaded", None])
+def test_missing_recording_date_while_processing_is_not_a_warning(
+    conn, config, tracker, make_video, caplog, processing
+):
+    """Seen on a real upload: recordingDetails absent right after upload while
+    processing, yet the date was set in YouTube Studio."""
+    video = make_uploaded(conn, make_video)
+    out = Out()
+
+    def response(vid):
+        r = verify_response(vid, recording_date=None, processing=processing or "x")
+        if processing is None:
+            del r["items"][0]["processingDetails"]
+        return r
+
+    with caplog.at_level(logging.INFO, logger="photos2yt.uploader"):
+        result = verify_upload(conn, config, tracker, make_api(verify=response), video, out=out)
+
+    assert result.recording_date_problem is None
+    assert result.recording_date_pending is True
+    assert "did not stick" not in out.text
+    assert "WARNING" not in out.text
+    assert "not visible yet" in out.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert quota_units(conn) == (1, 0)  # no extra videos.list re-check
+    assert get_video(conn, video.id).status == VideoStatus.UPLOADED
+
+
+def test_missing_recording_date_after_processing_succeeded_still_warns(
+    conn, config, tracker, make_video
+):
+    video = make_uploaded(conn, make_video)
+    out = Out()
+    yt = make_api(verify=lambda vid: verify_response(vid, recording_date=None,
+                                                     processing="succeeded"))
+    result = verify_upload(conn, config, tracker, yt, video, out=out)
+    assert result.recording_date_problem == "missing"
+    assert "did not stick (missing)" in out.text
+
+
+def test_differing_recording_date_warns_even_while_processing(conn, config, tracker, make_video):
+    video = make_uploaded(conn, make_video)
+    out = Out()
+    yt = make_api(verify=lambda vid: verify_response(vid, recording_date="2023-01-01T00:00:00Z",
+                                                     processing="processing"))
+    result = verify_upload(conn, config, tracker, yt, video, out=out)
+    assert result.recording_date_problem.startswith("differs")
+    assert "did not stick (differs" in out.text
+
+
+def _reset_package_logger():
+    pkg = logging.getLogger("photos2yt")
+    for h in list(pkg.handlers):
+        if not isinstance(h, logging.NullHandler):
+            pkg.removeHandler(h)
+
+
+@pytest.mark.parametrize("with_cli_logging", [False, True])
+def test_warning_shown_once_on_terminal(
+    conn, config, tracker, make_video, capsys, with_cli_logging
+):
+    """_warn prints via out and logs; neither logging.lastResort (no logging
+    configured, as in the real CLI before the fix) nor the CLI's stderr
+    handler may print it a second time."""
+    from photos2yt.cli import configure_logging
+
+    root = logging.getLogger()
+    saved_root_handlers = root.handlers[:]
+    seen = []
+
+    class Recorder(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    _reset_package_logger()
+    # pytest installs root handlers, which would hide lastResort; remove them so
+    # the terminal behaves like a plain `photos2yt upload` run.
+    root.handlers = []
+    try:
+        if with_cli_logging:
+            configure_logging()
+            configure_logging()  # idempotent
+            root.addHandler(Recorder())  # stands in for user-configured logging
+        video = make_uploaded(conn, make_video)
+        yt = make_api(verify=lambda vid: verify_response(vid, privacy="private"))
+        verify_upload(conn, config, tracker, yt, video, out=print)
+        captured = capsys.readouterr()
+    finally:
+        root.handlers = saved_root_handlers
+        _reset_package_logger()
+
+    terminal = captured.out + captured.err
+    assert terminal.count("PRIVATE-UPLOAD LOCK") == 1
+    assert "PRIVATE-UPLOAD LOCK" in captured.out
+    assert captured.err == ""
+    if with_cli_logging:
+        # Still logged, for anyone who configures logging.
+        assert sum("PRIVATE-UPLOAD LOCK" in m for m in seen) == 1
+
+
+def test_log_only_warning_still_reaches_stderr_with_cli_logging(capsys):
+    from photos2yt.cli import configure_logging
+
+    _reset_package_logger()
+    try:
+        configure_logging()
+        logging.getLogger("photos2yt.uploader").warning("retrying chunk")
+        captured = capsys.readouterr()
+    finally:
+        _reset_package_logger()
+    assert captured.err.count("retrying chunk") == 1
+
+
+def test_package_has_null_handler_so_last_resort_is_unused():
+    import photos2yt
+
+    pkg = logging.getLogger(photos2yt.__name__)
+    assert any(isinstance(h, logging.NullHandler) for h in pkg.handlers)
 
 
 # ---------------------------------------------------------------------------
