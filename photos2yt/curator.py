@@ -1,32 +1,98 @@
-"""Curator module: rules engine and dry-run plan generation for photos2yt."""
+"""Curator: put uploaded videos into playlists from declarative rules (Task 7).
+
+Rules live in a YAML file (``paths.rules`` in config.yaml, default
+``rules.yaml`` next to the config file, or ``photos2yt curate --rules PATH``):
+
+    playlists:
+      - name: "Christmas Day Through the Years"
+        privacy: unlisted
+        match:
+          any:
+            - {local_month: 12, local_day: 25}
+            - {tags_contain_any: ["Christmas Day"]}
+
+Matching uses ``taken_local_date`` (the local date from config.timezone),
+never the UTC timestamp. Within one condition every field must hold; ``any``
+needs at least one condition to hold, ``all`` needs every one. A rule with
+both needs both.
+
+The local DB is the source of truth: no search.list, no playlist reads.
+
+Running (``run_curation``):
+  1. For each rule (file order), ensure the playlist exists: look it up in the
+     ``playlists`` table, else ``playlists.insert`` and store the id at once.
+  2. Insert the rule's not-yet-added members in date order, (taken_utc, id).
+     Each insert gets an explicit ``position`` = the number of members already
+     added (per the DB) that sort before it, so the playlist ends up
+     date-sorted, including late-arriving older videos. A full backfill is
+     therefore positions 0, 1, 2, ...
+  3. Each success is written to ``playlist_membership`` (added=1, position)
+     right away; positions of later members shift by one, as on YouTube.
+     A failed add leaves added=0 and is retried on the next run; it does not
+     block the other adds.
+  4. UPLOADED videos whose matching playlists are all done become PLAYLISTED.
+     Videos that match no rule stay UPLOADED.
+
+Quota: ``QuotaTracker.can_afford`` before every call; cost recorded after
+each call that got a response. quotaExceeded marks the day exhausted and stops
+the run. A re-run with nothing left to do makes zero API calls.
+"""
 
 from __future__ import annotations
 
-import argparse
-import os
+import json
+import logging
 import re
-import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import yaml
+from googleapiclient.errors import HttpError
+from tenacity import RetryError, Retrying, retry_if_exception, stop_after_attempt
 
-from photos2yt.config import Config, ConfigError, load_config
+from photos2yt.config import Config
 from photos2yt.db import (
     VideoRecord,
-    get_connection,
-    init_db,
+    VideoStatus,
     add_playlist_membership,
+    get_playlist,
+    record_playlist_item_added,
+    transition_video_status,
     upsert_playlist,
-    get_playlist_memberships,
+)
+from photos2yt.quota import QuotaTracker
+from photos2yt.uploader import (
+    DEFAULT_MAX_ATTEMPTS,
+    _is_retryable,
+    _retry_wait,
+    _safe_error_text,
+    parse_http_error,
 )
 
+logger = logging.getLogger(__name__)
+
+Printer = Callable[[str], None]
+
+VALID_PRIVACY = ("private", "unlisted", "public")
+CONDITION_FIELDS = frozenset(
+    {"local_month", "local_day", "local_year", "title_contains_any", "tags_contain_any"}
+)
+_INT_RANGES = {"local_month": (1, 12), "local_day": (1, 31), "local_year": (1800, 9999)}
+MAX_PLAYLIST_TITLE = 150  # YouTube playlist title limit
+
+
+class RulesError(RuntimeError):
+    """The rules file is missing, unreadable or invalid."""
+
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class PlaylistRule:
-    """A single playlist rule with a name, privacy setting, and matching conditions."""
+    """One playlist: name, privacy for playlists.insert, and match conditions."""
 
     name: str
     privacy: str
@@ -34,721 +100,585 @@ class PlaylistRule:
 
     @property
     def any_conditions(self) -> Optional[list[dict[str, Any]]]:
-        """Return the 'any' condition list if present."""
         return self.match.get("any")
 
     @property
     def all_conditions(self) -> Optional[list[dict[str, Any]]]:
-        """Return the 'all' condition list if present."""
         return self.match.get("all")
 
 
-# --- CurationPlan class definition ---
+def resolve_rules_path(config: Config, override: Optional[str | Path] = None) -> tuple[Path, bool]:
+    """Return (rules path, explicitly_set).
 
-class CurationPlan(dict):
-    """Represents a curation plan produced by the curator."""
-
-    def __init__(self, playlists_to_create: list[str], videos_to_add: list[tuple[str, int, int]], estimated_cost: int, note: Optional[str] = None):
-        super().__init__()
-        self["playlists_to_create"] = playlists_to_create
-        self["videos_to_add"] = videos_to_add
-        self["estimated_cost"] = estimated_cost
-        if note is not None:
-            self["note"] = note
-
-    @property
-    def playlists_to_create(self) -> list[str]:
-        return list(self.get("playlists_to_create", []))
-
-    @property
-    def videos_to_add(self) -> list[tuple[str, int, int]]:
-        return list(self.get("videos_to_add", []))
-
-    @property
-    def estimated_cost(self) -> int:
-        return self.get("estimated_cost", 0)
-
-
-# --- Validation functions ---
-
-def _build_playlist_rules(rules_file: Optional[Path]) -> dict[str, PlaylistRule]:
-    """Load and validate playlist rules from a YAML file.
-
-    Returns a dict mapping rule name to PlaylistRule objects. Raises RuntimeError on validation failure.
-    
-    Validation order (errors reported in this priority):
-      1. Missing or non-dict top-level 'playlists' key
-      2. Non-dict items in the playlists list
-      3. Name not a string, empty name, duplicate names
-      4. Invalid privacy value
-      5. Invalid match field (not a dict)
-      6. Empty/unknown fields in conditions
-      7. Out-of-range or non-integer values for date fields
+    Order: CLI override, then ``paths.rules`` from config, then ``rules.yaml``
+    next to the config file (or in the current directory if the config has no
+    path). ``explicitly_set`` is False only for the last fallback.
     """
-    if not rules_file or not rules_file.exists():
-        return {}  # No rules loaded — curator will create all matching videos into new playlists
+    if override is not None:
+        return Path(override).expanduser().resolve(), True
+    if config.paths.rules is not None:
+        return Path(config.paths.rules), True
+    base = config.config_path.parent if config.config_path else Path.cwd()
+    return base / "rules.yaml", False
 
+
+def _validate_condition(name: str, where: str, j: int, cond: Any) -> None:
+    label = f"Playlist '{name}': condition {j} in '{where}'"
+    if not isinstance(cond, dict):
+        raise RulesError(f"{label} is not a mapping")
+    if not cond:
+        raise RulesError(f"{label} has no recognized fields (empty dict)")
+    for key in cond:
+        if key not in CONDITION_FIELDS:
+            raise RulesError(
+                f"{label} has unknown field {key!r}: unexpected field name "
+                f"(allowed: {', '.join(sorted(CONDITION_FIELDS))})"
+            )
+    for key, (lo, hi) in _INT_RANGES.items():
+        if key in cond:
+            val = cond[key]
+            if isinstance(val, bool) or not isinstance(val, int) or not lo <= val <= hi:
+                raise RulesError(
+                    f"{label} has invalid '{key}'={val!r}; must be an integer between {lo} and {hi}"
+                )
+    for key in ("title_contains_any", "tags_contain_any"):
+        if key in cond:
+            words = cond[key]
+            if (
+                not isinstance(words, list)
+                or not words
+                or not all(isinstance(w, str) and w.strip() for w in words)
+            ):
+                raise RulesError(
+                    f"{label} has invalid '{key}' (expected a non-empty list of non-empty strings)"
+                )
+
+
+def load_rules(rules_file: Path) -> dict[str, PlaylistRule]:
+    """Load and validate rules. Returns {name: rule} in file order. Raises RulesError."""
     try:
         with open(rules_file, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f)
-    except (yaml.YAMLError, OSError):
-        raise RuntimeError(
-            f"Failed to parse rules.yaml at {rules_file}: error reading file",
-        )
+    except FileNotFoundError:
+        raise RulesError(f"Rules file not found: {rules_file}") from None
+    except (yaml.YAMLError, OSError) as e:
+        raise RulesError(f"Failed to read rules file {rules_file}: {e}") from None
 
+    if raw is None:
+        return {}
     if not isinstance(raw, dict):
-        raise RuntimeError("Root of rules.yaml must be a mapping (got something else)")
-
+        raise RulesError("Root of the rules file must be a mapping")
     playlists_raw = raw.get("playlists")
     if playlists_raw is None:
-        return {}  # Empty rules file — curator will create all matching videos into new playlists
-
+        return {}
     if not isinstance(playlists_raw, list):
-        raise RuntimeError(
-            f"Top-level 'playlists' must be a list (got {type(playlists_raw).__name__})",
+        raise RulesError(
+            f"Top-level 'playlists' must be a list (got {type(playlists_raw).__name__})"
         )
 
     rules: dict[str, PlaylistRule] = {}
-
     for i, item in enumerate(playlists_raw):
         if not isinstance(item, dict):
-            raise RuntimeError(
-                f"Each playlist must be a mapping; item {i} is not a dictionary",
-            )
-
+            raise RulesError(f"Each playlist must be a mapping; item {i} is not")
         name_val = item.get("name")
-        
-        # Validate that 'name' is a string first (before checking content or duplicates)
-        if not isinstance(name_val, str):
-            raise RuntimeError(f"Playlist 'name' must be a non-empty string, got: {type(name_val).__name__}({repr(name_val)})")
-
-        name_str = name_val.strip() if name_val else ""
-        
-        # Check for empty name
-        if not name_str:
-            raise RuntimeError(f"Playlist 'name' must be a non-empty string, got: {repr(name_val)}")
-
-        # Check for duplicate names BEFORE privacy or match validation.
-        # This ensures we report "duplicate name" before any other error about the same playlist entry.
-        if name_str in rules:
-            raise RuntimeError(
-                f"Duplicate playlist name: {name_str!r} appears more than once",
+        if not isinstance(name_val, str) or not name_val.strip():
+            raise RulesError(f"Playlist 'name' must be a non-empty string, got: {name_val!r}")
+        name = name_val.strip()
+        if len(name) > MAX_PLAYLIST_TITLE or "<" in name or ">" in name:
+            raise RulesError(
+                f"Playlist name {name!r} must be at most {MAX_PLAYLIST_TITLE} characters "
+                "and contain no '<' or '>'"
             )
+        if name in rules:
+            raise RulesError(f"Duplicate playlist name: {name!r} appears more than once")
 
-        # Validate privacy BEFORE checking match (so errors are in priority order)
         privacy = item.get("privacy")
-        if not isinstance(privacy, str) or privacy.lower() not in ("unlisted", "public", "private"):
-            raise RuntimeError(
-                f"Playlist '{name_str}' has invalid 'privacy': {repr(privacy)}; must be one of: unlisted, public, private",
+        if not isinstance(privacy, str) or privacy.strip().lower() not in VALID_PRIVACY:
+            raise RulesError(
+                f"Playlist '{name}' has invalid 'privacy': {privacy!r}; "
+                f"must be one of: {', '.join(VALID_PRIVACY)}"
             )
 
-        # Validate match field BEFORE duplicate check — this is the correct order since
-        # we want to catch schema errors (missing/invalid match) before reporting duplicates.
-        if "match" not in item:
-            raise RuntimeError(f"Playlist '{name_str}' has invalid 'match': expected a mapping")
-
-        match = item["match"]
+        match = item.get("match")
         if not isinstance(match, dict):
-            raise RuntimeError(f"Playlist '{name_str}' has invalid 'match': expected a mapping")
-
-        any_conditions = match.get("any")
-        all_conditions = match.get("all")
-
-        # Validate 'any' conditions
-        if isinstance(any_conditions, list):
-            for j, cond in enumerate(any_conditions):
-                if not isinstance(cond, dict):
-                    raise RuntimeError(
-                        f"Playlist '{name_str}': condition {j} in 'any' is not a mapping",
+            raise RulesError(f"Playlist '{name}' has invalid 'match': expected a mapping")
+        unknown = set(match) - {"any", "all"}
+        if unknown:
+            raise RulesError(
+                f"Playlist '{name}' has invalid 'match': unknown key(s) {sorted(unknown)}; "
+                "use 'any' and/or 'all'"
+            )
+        if not match:
+            raise RulesError(f"Playlist '{name}' has invalid 'match': needs 'any' or 'all'")
+        for where in ("any", "all"):
+            if where in match:
+                conds = match[where]
+                if not isinstance(conds, list) or not conds:
+                    raise RulesError(
+                        f"Playlist '{name}' has invalid 'match.{where}': expected a non-empty list"
                     )
-                # Check for empty match conditions (no known fields present) or unknown fields
-                known_fields = {"local_month", "local_day", "local_year", "title_contains_any", "tags_contain_any"}
-                if not cond:
-                    raise RuntimeError(
-                        f"Playlist '{name_str}': condition {j} in 'any' has no recognized fields (empty dict)",
-                    )
-                # Check for unknown/invalid fields
-                valid_fields = {"local_month", "local_day", "local_year", "title_contains_any", "tags_contain_any"}
-                for key in cond:
-                    if key not in valid_fields:
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} has unknown field 'key': unexpected field name",
-                        )
+                for j, cond in enumerate(conds):
+                    _validate_condition(name, where, j, cond)
 
-                # Validate local_month
-                if "local_month" in cond:
-                    val = cond["local_month"]
-                    if isinstance(val, bool):
-                        raise RuntimeError(f"Playlist '{name_str}': condition {j} has invalid 'local_month' (bool is not allowed)")
-                    if not isinstance(val, int) or val < 1 or val > 12:
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} has invalid 'local_month'={val}; must be integer between 1 and 12",
-                        )
-
-                # Validate local_day
-                if "local_day" in cond:
-                    val = cond["local_day"]
-                    if isinstance(val, bool):
-                        raise RuntimeError(f"Playlist '{name_str}': condition {j} has invalid 'local_day' (bool is not allowed)")
-                    if not isinstance(val, int) or val < 1 or val > 31:
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} has invalid 'local_day'={val}; must be integer between 1 and 31",
-                        )
-
-                # Validate title_contains_any
-                if "title_contains_any" in cond:
-                    keywords = cond["title_contains_any"]
-                    if not isinstance(keywords, list):
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} has invalid 'title_contains_any' (expected a list)",
-                        )
-
-                # Validate tags_contain_any
-                if "tags_contain_any" in cond:
-                    keywords = cond["tags_contain_any"]
-                    if not isinstance(keywords, list):
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} has invalid 'tags_contain_any' (expected a list)",
-                        )
-
-        # Validate 'all' conditions similarly
-        if isinstance(all_conditions, list):
-            for j, cond in enumerate(all_conditions):
-                if not isinstance(cond, dict):
-                    raise RuntimeError(
-                        f"Playlist '{name_str}': condition {j} in 'all' is not a mapping",
-                    )
-
-                # Check for empty match conditions or unknown fields
-                known_fields = {"local_month", "local_day", "local_year", "title_contains_any", "tags_contain_any"}
-                if not cond:
-                    raise RuntimeError(
-                        f"Playlist '{name_str}': condition {j} in 'all' has no recognized fields (empty dict)",
-                    )
-                for key in cond:
-                    if key not in known_fields:
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} in 'all' has unknown field 'key': unexpected field name",
-                        )
-
-                # Validate local_month
-                if "local_month" in cond:
-                    val = cond["local_month"]
-                    if isinstance(val, bool):
-                        raise RuntimeError(f"Playlist '{name_str}': condition {j} has invalid 'local_month' (bool is not allowed)")
-                    if not isinstance(val, int) or val < 1 or val > 12:
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} has invalid 'local_month'={val}; must be integer between 1 and 12",
-                        )
-
-                # Validate title_contains_any
-                if "title_contains_any" in cond:
-                    keywords = cond["title_contains_any"]
-                    if not isinstance(keywords, list):
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} has invalid 'title_contains_any' (expected a list)",
-                        )
-
-                # Validate tags_contain_any
-                if "tags_contain_any" in cond:
-                    keywords = cond["tags_contain_any"]
-                    if not isinstance(keywords, list):
-                        raise RuntimeError(
-                            f"Playlist '{name_str}': condition {j} has invalid 'tags_contain_any' (expected a list)",
-                        )
-
-        rules[name_str] = PlaylistRule(name=name_str, privacy=privacy, match=item.get("match", {}))
-
+        rules[name] = PlaylistRule(name=name, privacy=privacy.strip().lower(), match=match)
     return rules
 
 
-# --- Matching functions ---
+# Backwards-compatible name (Task 7A).
+_build_playlist_rules = load_rules
 
-def _match_rule(rule: PlaylistRule, video: VideoRecord) -> Optional[str]:
-    """Evaluate a single playlist rule against a video.
 
-    Returns:
-        The matching condition description (e.g., "local_month=12, local_day=25") if matched,
-        or None if the rule does not match.
-    """
-    # Check 'any' conditions first — if any one matches, the rule matches
-    rule_any = rule.any_conditions
-    if rule_any is not None:
-        for condition in rule_any:
-            cond_str = _format_condition(condition)
+# ---------------------------------------------------------------------------
+# Matching
+# ---------------------------------------------------------------------------
 
-            if "local_month" in condition and "local_day" in condition:
-                # Date-based match using taken_local_date (never UTC!)
-                date_str = video.taken_local_date or ""
-                try:
-                    dt_naive = datetime.strptime(date_str, "%Y-%m-%d")
-                    if (dt_naive.month, dt_naive.day) == (condition["local_month"], condition["local_day"]):
-                        return cond_str
-                except (ValueError, TypeError):
-                    pass
-
-            elif "title_contains_any" in condition:
-                keywords = [kw.strip() for kw in condition["title_contains_any"]]
-                if _match_title_keyword(keywords, video.title or ""):
-                    return cond_str
-
-            elif "tags_contain_any" in condition:
-                keywords = [kw.strip() for kw in condition["tags_contain_any"]]
-                if _match_tags_keyword(keywords, video.tags_json):
-                    return cond_str
-
-    # Check 'all' conditions — all must match for a rule to match
-    rule_all = rule.all_conditions
-    if rule_all is not None and len(rule_all) > 0:
-        # For 'all', every condition must be satisfied. If any fails, the rule doesn't match.
-        for condition in rule_all:
-            cond_str = _format_condition(condition)
-
-            if "local_month" in condition and "local_day" in condition:
-                date_str = video.taken_local_date or ""
-                try:
-                    dt_naive = datetime.strptime(date_str, "%Y-%m-%d")
-                    if (dt_naive.month, dt_naive.day) != (condition["local_month"], condition["local_day"]):
-                        return None  # This rule doesn't match — one of the 'all' conditions failed
-                except (ValueError, TypeError):
-                    return None
-
-            elif "title_contains_any" in condition:
-                keywords = [kw.strip() for kw in condition["title_contains_any"]]
-                if not _match_title_keyword(keywords, video.title or ""):
-                    return None
-
-            elif "tags_contain_any" in condition:
-                keywords = [kw.strip() for kw in condition["tags_contain_any"]]
-                if not _match_tags_keyword(keywords, video.tags_json):
-                    return None
-
-        # All 'all' conditions passed — rule matches
-        all_strs = [_format_condition(c) for c in rule_all]
-        return ", ".join(all_strs)
-
-    # No conditions matched or no conditions were specified at all
-    return None
+def _keyword_regex(keywords: list[str]) -> re.Pattern[str]:
+    escaped = [re.escape(kw.strip()) for kw in keywords if kw.strip()]
+    return re.compile(r"\b(" + "|".join(escaped) + r")\b", re.IGNORECASE)
 
 
 def _match_title_keyword(keywords: list[str], video_title: str) -> bool:
-    """Check if any of the given keywords appear as whole words in the title.
-
-    Matching is case-insensitive and uses word boundaries (so "Christmas" does not
-    match "Christmassy").
-
-    Args:
-        keywords: List of keyword strings to search for.
-        video_title: The video title to search within.
-
-    Returns:
-        True if at least one keyword matches as a whole word in the title.
-    """
-    if not keywords:
+    """Case-insensitive whole-word match of any keyword in the title."""
+    if not keywords or not any(kw.strip() for kw in keywords):
         return False
-
-    # Build a case-insensitive regex pattern with word boundaries
-    escaped = [re.escape(kw) for kw in keywords]
-    pattern = r"\b(" + "|".join(escaped) + r")\b"
-    compiled = re.compile(pattern, re.IGNORECASE)
-
-    return bool(compiled.search(video_title))
+    return bool(_keyword_regex(keywords).search(video_title or ""))
 
 
 def _match_tags_keyword(keywords: list[str], video_tags_json: Optional[str]) -> bool:
-    """Check if any of the given keywords appear in the tags.
-
-    Tags are stored as a JSON array. Matching is case-insensitive and uses word boundaries.
-
-    Args:
-        keywords: List of keyword strings to search for.
-        video_tags_json: The raw JSON string containing tags (e.g., '["summer", "vacation"]').
-
-    Returns:
-        True if at least one keyword matches as a whole word in any tag.
-    """
-    if not keywords or video_tags_json is None:
+    """Case-insensitive whole-word match of any keyword in any tag (tags are a JSON list)."""
+    if not keywords or not video_tags_json or not any(kw.strip() for kw in keywords):
         return False
-
     try:
-        import json
         tags = json.loads(video_tags_json)
-        if not isinstance(tags, list):
-            return False
-        # Lowercase all for case-insensitive whole-word matching
-        tags_lower = [t.lower() for t in tags]
-        escaped = [re.escape(kw) for kw in keywords]
-        pattern = r"\b(" + "|".join(escaped) + r")\b"
-        compiled = re.compile(pattern, re.IGNORECASE)
     except (json.JSONDecodeError, TypeError):
         return False
+    if not isinstance(tags, list):
+        return False
+    pattern = _keyword_regex(keywords)
+    return any(isinstance(t, str) and pattern.search(t) for t in tags)
 
-    # Check each tag against the regex
-    for tag in tags_lower:
-        if bool(compiled.search(tag)):
-            return True
 
-    return False
+def _local_date_parts(video: VideoRecord) -> Optional[tuple[int, int, int]]:
+    """(year, month, day) from taken_local_date ('YYYY-MM-DD'), or None."""
+    try:
+        y, m, d = (int(p) for p in (video.taken_local_date or "").split("-"))
+    except ValueError:
+        return None
+    return y, m, d
+
+
+def _condition_holds(cond: dict[str, Any], video: VideoRecord) -> bool:
+    """Every field in the condition must hold."""
+    if any(k in cond for k in _INT_RANGES):
+        parts = _local_date_parts(video)
+        if parts is None:
+            return False
+        year, month, day = parts
+        if "local_year" in cond and cond["local_year"] != year:
+            return False
+        if "local_month" in cond and cond["local_month"] != month:
+            return False
+        if "local_day" in cond and cond["local_day"] != day:
+            return False
+    if "title_contains_any" in cond and not _match_title_keyword(
+        cond["title_contains_any"], video.title or ""
+    ):
+        return False
+    if "tags_contain_any" in cond and not _match_tags_keyword(
+        cond["tags_contain_any"], video.tags_json
+    ):
+        return False
+    return True
 
 
 def _format_condition(condition: dict[str, Any]) -> str:
-    """Format a condition dictionary into a human-readable string."""
-    parts = []
-    if "local_month" in condition and isinstance(condition["local_month"], int):
-        parts.append(f"local_month={condition['local_month']}")
-    if "local_day" in condition and isinstance(condition["local_day"], int):
-        parts.append(f"local_day={condition['local_day']}")
-    if "local_year" in condition and isinstance(condition["local_year"], int):
-        parts.append(f"local_year={condition['local_year']}")
-    if "title_contains_any" in condition:
-        parts.append(
-            f"title_contains_any={[t.strip() for t in condition['title_contains_any'] if t.strip()]}"
-        )
-    if "tags_contain_any" in condition:
-        parts.append(
-            f"tags_contain_any={[t.strip() for t in condition['tags_contain_any'] if t.strip()]}"
-        )
-    return ", ".join(parts) if parts else "(no constraints)"
+    return ", ".join(f"{k}={condition[k]!r}" for k in sorted(condition)) or "(no constraints)"
 
 
-# --- Plan computation functions ---
+def _match_rule(rule: PlaylistRule, video: VideoRecord) -> Optional[str]:
+    """Return a description of why the rule matches the video, or None."""
+    any_c, all_c = rule.any_conditions, rule.all_conditions
+    if not any_c and not all_c:
+        return None
+    reasons: list[str] = []
+    if any_c:
+        hit = next((c for c in any_c if _condition_holds(c, video)), None)
+        if hit is None:
+            return None
+        reasons.append(_format_condition(hit))
+    if all_c:
+        if not all(_condition_holds(c, video) for c in all_c):
+            return None
+        reasons.extend(_format_condition(c) for c in all_c)
+    return "; ".join(reasons)
 
-def _compute_target_positions(
-    conn,
-    rules: dict[str, PlaylistRule],
-    all_matching_videos: list[VideoRecord],
-    matches: list[tuple[PlaylistRule, VideoRecord]],
-) -> tuple[list[str], list[tuple[int, int]]]:
-    """Compute target positions for each video in its playlist.
 
-    The target position is the 0-based index of the video within that playlist's sorted order
-    (sorted by taken_utc ascending, then id ascending).
+# ---------------------------------------------------------------------------
+# Planning (read-only)
+# ---------------------------------------------------------------------------
 
-    Args:
-        conn: Database connection.
-        rules: Dict of loaded rules.
-        all_matching_videos: Videos sorted by (taken_utc, id).
-        matches: List of (rule, video) pairs.
+def _sort_key(video: VideoRecord) -> tuple[str, int]:
+    return (video.taken_utc or "", video.id)
 
-    Returns:
-        A tuple of (list of playlist names, list of (video_id, target_position) tuples).
+
+def _eligible_videos(conn) -> list[VideoRecord]:
+    """UPLOADED/PLAYLISTED rows that have a YouTube id, in date order."""
+    rows = conn.execute(
+        "SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED') "
+        "AND youtube_video_id IS NOT NULL AND youtube_video_id != '' "
+        "ORDER BY taken_utc ASC, id ASC"
+    ).fetchall()
+    return sorted((VideoRecord.from_row(r) for r in rows), key=_sort_key)
+
+
+def _added_video_ids(conn, playlist_name: str) -> set[int]:
+    rows = conn.execute(
+        "SELECT video_id FROM playlist_membership WHERE playlist_name = ? AND added = 1",
+        (playlist_name,),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def _target_position(members: list[VideoRecord], added: set[int], video: VideoRecord) -> int:
+    """Number of already-added members that sort before ``video``."""
+    key = _sort_key(video)
+    return sum(1 for m in members if m.id in added and _sort_key(m) < key)
+
+
+@dataclass
+class PlannedAdd:
+    playlist_name: str
+    video: VideoRecord
+    position: int
+
+
+@dataclass
+class PlaylistPlan:
+    rule: PlaylistRule
+    youtube_playlist_id: Optional[str]  # None: playlists.insert needed
+    members: list[VideoRecord]          # every matching video, date order
+    already_added: set[int]
+    to_add: list[PlannedAdd]
+
+    @property
+    def needs_create(self) -> bool:
+        return self.youtube_playlist_id is None
+
+
+@dataclass
+class CurationPlan:
+    playlists: list[PlaylistPlan] = field(default_factory=list)
+    estimated_cost: int = 0
+    note: Optional[str] = None
+
+    @property
+    def playlists_to_create(self) -> list[str]:
+        return [p.rule.name for p in self.playlists if p.needs_create and p.to_add]
+
+    @property
+    def videos_to_add(self) -> list[tuple[str, int, int]]:
+        """(playlist name, video id, target position) in execution order."""
+        return [(a.playlist_name, a.video.id, a.position) for p in self.playlists for a in p.to_add]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.videos_to_add
+
+
+def build_plan(conn, rules: Optional[dict[str, PlaylistRule]], config: Optional[Config] = None) -> CurationPlan:
+    """Work out what a run would do. Only reads from ``conn``.
+
+    Planned positions assume every earlier add in the same run succeeds; the
+    real run recomputes each position from what has actually been added.
+    A playlist is only created when it has at least one video to add.
     """
-    # Query existing playlists from the DB — these are already created and should not be listed
-    cursor = conn.execute("SELECT name FROM playlists")
-    existing_playlist_names = set(row[0] for row in cursor.fetchall())
+    if not rules:
+        return CurationPlan(note="No playlists configured in the rules file")
 
-    # Build a set of already-added videos for each playlist so we can skip them.
-    # Use .get() with default empty set to avoid KeyError when a video has no membership record yet.
-    already_added = {}  # video_id -> set of playlist_names where added=1
-    memberships = get_playlist_memberships(conn)
-    for membership in memberships:
-        vid_id = membership["video_id"]
-        pl_name = membership["playlist_name"]
-        if not membership["added"]:
-            continue
-        if vid_id not in already_added:
-            already_added[vid_id] = set()
-        already_added[vid_id].add(pl_name)
-
-    # Pre-sort ALL matching videos by (taken_utc, id) — this is the canonical order.
-    # We use this pre-sorted list to compute target positions for each playlist,
-    # including already-added videos from previous runs or manual additions.
-    all_videos_sorted: list[VideoRecord] = sorted(all_matching_videos, key=lambda v: (v.taken_utc or "", v.id))
-
-    plan_by_playlist: dict[str, list[tuple[int, int]]] = {}  # playlist_name -> [(video_id, target_position)]
-
+    videos = _eligible_videos(conn)
+    plan = CurationPlan()
     for rule in rules.values():
-        pl_name = rule.name
-
-        # Use the pre-sorted all_videos_sorted to compute target positions for this playlist.
-        # This gives each video its 0-based index in the (taken_utc, id)-sorted order of ALL
-        # members (both already-added and planned), which is exactly what the tests expect.
-        sorted_members = [vid for vid in all_videos_sorted if _match_rule(rule, vid) is not None]
-
-        # Compute positions — only for videos NOT already added.
-        # Use .get() with default empty set to handle videos without membership records.
-        positions: list[tuple[int, int]] = []
-        for i, video in enumerate(sorted_members):
-            if video.id not in already_added.get(video.id, set()):
-                target_position = i  # zero-based index among all members (already-added + planned)
-                positions.append((video.id, target_position))
-
-        plan_by_playlist[pl_name] = positions
-
-    # Exclude playlists that already exist in the DB or have any membership rows (already processed)
-    valid_playlists = {
-        pl_name for pl_name in plan_by_playlist.keys()
-        if pl_name not in existing_playlist_names
-        and not get_playlist_memberships(conn, playlist_name=pl_name)
-    }
-    # Flatten: group by playlist name, then by position within each playlist (only valid playlists)
-    videos_to_add: list[tuple[str, int, int]] = []  # (playlist_name, video_id, target_position)
-    for pl_name in sorted(valid_playlists):
-        for vid_id, pos in sorted(plan_by_playlist[pl_name], key=lambda x: x[1]):
-            videos_to_add.append((pl_name, vid_id, pos))
-
-    return sorted(valid_playlists), videos_to_add
-
-
-def _compute_cost(config: Config, rule_names: list[str], videos_added_count: int) -> int:
-    """Compute estimated quota cost for the plan.
-
-    Args:
-        config: Configuration object with quota settings.
-        rule_names: List of playlist names to create.
-        videos_added_count: Total number of videos that would be added (summed across playlists).
-
-    Returns:
-        Estimated quota units consumed.
-    """
-    total_cost = 0
-
-    for pl_name in rule_names:
-        insert_cost = config.quota.playlist_insert_cost
-        total_cost += insert_cost
-
-    per_item_cost = config.quota.playlist_item_insert_cost
-    total_cost += videos_added_count * per_item_cost
-
-    return total_cost
-
-
-def build_plan(
-    conn,
-    rules: Optional[dict[str, PlaylistRule]],
-    config: Optional[Config] = None,
-) -> CurationPlan:
-    """Build the curation plan.
-
-    Args:
-        conn: Database connection (can be :memory: for testing).
-        rules: Dict of loaded PlaylistRule objects (or None for no rules).
-        config: Configuration object for cost computation.
-
-    Returns:
-        A CurationPlan describing what would be done.
-    """
-    # If no rules defined — produce an empty plan (videos stay UPLOADED)
-    if rules is None:
-        return CurationPlan(
-            playlists_to_create=[],
-            videos_to_add=[],
-            estimated_cost=0,
-            note="No playlists configured in rules.yaml",
-        )
-
-    # Fetch all matching videos and matches
-    cursor = conn.execute(
-        "SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED') ORDER BY taken_utc ASC, id ASC",
-    )
-    all_matching_videos = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-
-    # Compute matches: which rule matches which video
-    matches: list[tuple[PlaylistRule, VideoRecord]] = []
-    for video in all_matching_videos:
-        for rule_name, rule in rules.items():
-            matched_condition = _match_rule(rule, video)
-            if matched_condition is not None:
-                matches.append((rule, video))
-
-    # Compute target positions using (taken_utc, id) ordering
-    playlist_names, videos_to_add = _compute_target_positions(conn, rules, all_matching_videos, matches)
-
-    # Compute cost — use config if provided, otherwise compute a default estimate
-    estimated_cost = 0
-    if config is not None:
-        estimated_cost = _compute_cost(config, playlist_names, len(videos_to_add))
-
-    return CurationPlan(
-        playlists_to_create=playlist_names,
-        videos_to_add=videos_to_add,
-        estimated_cost=estimated_cost,
-    )
-
-
-def curate_plan(
-    config: Optional[Config],
-    rules_file: Optional[Path] = None,
-    conn: Optional[__import__('sqlite3').Connection] = None,
-) -> CurationPlan:
-    """Public entry point for building a curation plan.
-
-    Args:
-        config: Configuration object (used only if conn is not provided).
-        rules_file: Path to the rules YAML file (or None for no rules).
-        conn: Optional database connection. If provided, uses this instead of deriving from config.
-
-    Returns:
-        A CurationPlan describing what would be done.
-    """
-    # Use provided connection or derive from config
-    if conn is not None:
-        cursor = conn  # Use the passed-in connection directly (don't close it — caller owns it)
-        use_new_conn = False
-    else:
-        config = _ensure_config(config)
-        db_path = config.paths.db_path
-        cursor = get_connection(db_path)
-        use_new_conn = True
-
-    try:
-        init_db(cursor)
-        # If no rules_file, treat as "no rules" -> empty plan
-        if not rules_file or not rules_file.exists():
-            return CurationPlan(
-                playlists_to_create=[],
-                videos_to_add=[],
-                estimated_cost=0,
-                note="No rules.yaml found — all matching videos remain UPLOADED",
+        members = [v for v in videos if _match_rule(rule, v) is not None]
+        row = get_playlist(conn, rule.name)
+        added = _added_video_ids(conn, rule.name) if row is not None else set()
+        simulated = set(added)
+        to_add: list[PlannedAdd] = []
+        for video in members:
+            if video.id in added:
+                continue
+            to_add.append(PlannedAdd(rule.name, video, _target_position(members, simulated, video)))
+            simulated.add(video.id)
+        plan.playlists.append(
+            PlaylistPlan(
+                rule=rule,
+                youtube_playlist_id=row["youtube_playlist_id"] if row is not None else None,
+                members=members,
+                already_added=added,
+                to_add=to_add,
             )
-
-        try:
-            rules = _build_playlist_rules(rules_file)
-        except RuntimeError as e:
-            raise RuntimeError(f"Rules validation error: {e}") from None
-
-        return build_plan(cursor, rules, config=config)
-
-    finally:
-        if use_new_conn:
-            cursor.close()
-
-
-def curate_dry_run(
-    config: Config,
-    rules_file: Optional[Path],
-    conn: Optional[__import__('sqlite3').Connection] = None,
-) -> CurationPlan:
-    """Run a dry-run of the curator — build and print the plan without modifying state.
-
-    Args:
-        config: Configuration object.
-        rules_file: Path to the rules YAML file (or None).
-        conn: Optional database connection. If provided, uses this instead of deriving from config.
-
-    Returns:
-        A CurationPlan describing what would be done.
-    """
-    if not isinstance(config, Config):
-        raise TypeError(f"config must be a photos2yt.config.Config, got {type(config).__name__}")
-
-    plan = curate_plan(config=config, rules_file=rules_file, conn=conn)
-
-    # Print formatted output
-    print(_format_plan_for_output(plan))
-
+        )
+    if config is not None:
+        plan.estimated_cost = (
+            len(plan.playlists_to_create) * config.quota.playlist_insert_cost
+            + len(plan.videos_to_add) * config.quota.playlist_item_insert_cost
+        )
     return plan
 
 
-def _ensure_config(config: Optional[Config]) -> Config:
-    """Ensure a config object exists. Returns default config if None."""
-    if config is not None:
-        return config
-    # Load default config
-    from photos2yt.config import load_config
-    base_path = Path(__file__).parent.parent / "photos2yt"
-    return load_config(base_path / "config.yaml.example")
-
-
-def _format_plan_for_output(plan: CurationPlan) -> str:
-    """Format a curation plan for human-readable output."""
-    lines = []
-    lines.append("=" * 72)
-    lines.append("CURATION PLAN")
-    lines.append("=" * 72)
-
-    if plan.get("note"):
-        lines.append(f"\nNote: {plan['note']}")
-
-    playlists_to_create = plan.playlists_to_create
-    videos_to_add = plan.videos_to_add
-
-    if not playlists_to_create and not videos_to_add:
-        lines.append("\nNo action required — all matching videos have already been added to their playlists.")
+def format_plan(plan: CurationPlan, config: Optional[Config] = None, tracker: Optional[QuotaTracker] = None) -> str:
+    lines = ["[DRY RUN] Curation plan"]
+    if plan.note:
+        lines.append(f"  {plan.note}")
+    for p in plan.playlists:
+        if p.needs_create:
+            state = f"would create ({p.rule.privacy})" if p.to_add else "not created yet, no videos"
+        else:
+            state = f"exists ({len(p.already_added)} added)"
+        lines.append(f"  Playlist '{p.rule.name}': {state}, {len(p.to_add)} video(s) to add")
+        for a in p.to_add:
+            lines.append(
+                f"    position {a.position}: row {a.video.id}  {a.video.taken_local_date or '?'}  "
+                f"{a.video.title or ''}"
+            )
+    if plan.is_empty:
+        lines.append("  Nothing to do: every matching video is already in its playlists.")
     else:
-        # Group videos by playlist for display
-        by_playlist: dict[str, list[tuple[int, int]]] = {}
-        for pl_name, vid_id, pos in videos_to_add:
-            if pl_name not in by_playlist:
-                by_playlist[pl_name] = []
-            by_playlist[pl_name].append((vid_id, pos))
-
-        lines.append(f"\nPlaylists to create ({len(playlists_to_create)}):")
-        for pl_name in playlists_to_create:
-            lines.append(f"  - {pl_name}")
-
-        if videos_to_add:
-            lines.append(f"\nVideos to add (in order of execution, with target positions within each playlist):")
-            current_playlist = None
-            for pl_name, vid_id, pos in videos_to_add:
-                if pl_name != current_playlist:
-                    current_playlist = pl_name
-                    lines.append(f"  Playlist: {pl_name}")
-                lines.append(f"    video #{vid_id} -> target position {pos}")
-
-        lines.append("\nEstimated quota cost (units): " + str(plan.estimated_cost))
-
-    lines.append("=" * 72)
-
+        lines.append(
+            f"  {len(plan.playlists_to_create)} playlist(s) to create, "
+            f"{len(plan.videos_to_add)} video add(s)."
+        )
+    if config is not None:
+        lines.append(
+            f"  Estimated quota: {plan.estimated_cost} units "
+            f"({config.quota.playlist_insert_cost} per playlist, "
+            f"{config.quota.playlist_item_insert_cost} per video add)."
+        )
+    if tracker is not None and not plan.is_empty:
+        if tracker.is_exhausted():
+            lines.append("  Today's quota is marked exhausted: a real run would stop at once.")
+        else:
+            remaining = tracker.remaining()
+            lines.append(f"  Remaining quota today (local counter): {remaining} units.")
+            if plan.estimated_cost > remaining:
+                lines.append("  Not enough for the whole plan: a real run would stop early "
+                             "and continue on a later run.")
     return "\n".join(lines)
 
 
-# --- CLI entry point ---
+def curate_plan(config: Optional[Config], rules_file: Optional[Path], conn) -> CurationPlan:
+    """Load rules and build the plan on an open connection (read-only)."""
+    if rules_file is None or not Path(rules_file).exists():
+        return CurationPlan(note=f"No rules file found at {rules_file}")
+    return build_plan(conn, load_rules(Path(rules_file)), config=config)
 
-def main() -> int:
-    """CLI handler for 'photos2yt curate'."""
-    parser = argparse.ArgumentParser(prog="photos2yt", description="Google Photos to YouTube Migration & Curation Tool")
-    parser.add_argument(
-        "-c",
-        "--config-path",
-        default=None,
-        help="Path to YAML config file (default: config.yaml or $PHOTOS2YT_CONFIG)",
-    )
 
-    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+def curate_dry_run(config: Config, rules_file: Optional[Path], conn, out: Printer = print) -> CurationPlan:
+    """Build and print the plan. Reads only; never writes to ``conn``."""
+    plan = curate_plan(config, rules_file, conn)
+    out(format_plan(plan, config))
+    return plan
 
-    # curate command
-    curate_parser = subparsers.add_parser("curate", help="Organize uploaded videos into playlists based on rules")
-    curate_parser.add_argument(
-        "--dry-run", action="store_true", default=True,
-        help="Simulate curation without modifying playlists (default)"
-    )
 
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Running
+# ---------------------------------------------------------------------------
 
-    if not args.subcommand or args.subcommand != "curate":
-        print("Unknown subcommand. Use 'photos2yt curate --help' for usage.")
-        return 1
+class _QuotaStop(Exception):
+    """Stop the whole run (local counter says no, or quotaExceeded)."""
 
+
+@dataclass
+class CurationSummary:
+    playlists_created: list[str] = field(default_factory=list)
+    added: int = 0
+    failed: int = 0
+    marked_playlisted: int = 0
+    api_calls: int = 0
+    quota_stopped: bool = False
+    errors: list[str] = field(default_factory=list)
+
+
+class _Runner:
+    def __init__(self, conn, config: Config, tracker: QuotaTracker,
+                 youtube_factory: Callable[[], Any], out: Printer,
+                 sleep: Optional[Callable[[float], None]], max_attempts: int) -> None:
+        self.conn = conn
+        self.config = config
+        self.tracker = tracker
+        self._factory = youtube_factory
+        self._youtube = None
+        self.out = out
+        self.sleep = sleep
+        self.max_attempts = max_attempts
+        self.summary = CurationSummary()
+
+    @property
+    def youtube(self):
+        if self._youtube is None:
+            self._youtube = self._factory()
+        return self._youtube
+
+    def _call(self, make_request: Callable[[], Any], cost: int, what: str) -> dict:
+        """Execute one API call: quota check, retries, quota record.
+
+        Raises _QuotaStop on a local quota stop or quotaExceeded; HttpError or
+        RetryError for other failures.
+        """
+        if not self.tracker.can_afford(cost):
+            raise _QuotaStop(f"not enough quota left today for {what} ({cost} units)")
+        kwargs = {"sleep": self.sleep} if self.sleep is not None else {}
+        retrying = Retrying(
+            retry=retry_if_exception(_is_retryable),
+            wait=_retry_wait,
+            stop=stop_after_attempt(self.max_attempts),
+            reraise=False,
+            **kwargs,
+        )
+
+        def attempt():
+            self.summary.api_calls += 1
+            return make_request().execute()
+
+        try:
+            response = retrying(attempt)
+        except RetryError as exc:
+            last = exc.last_attempt.exception()
+            if isinstance(last, HttpError):
+                self.tracker.record(cost)
+            raise
+        except HttpError as exc:
+            info = parse_http_error(exc)
+            if info.reason == "quotaExceeded":
+                self.tracker.mark_exhausted()
+                raise _QuotaStop(f"YouTube returned quotaExceeded during {what}") from exc
+            # The request reached YouTube and was rejected; it may still be charged.
+            self.tracker.record(cost)
+            raise
+        self.tracker.record(cost)
+        return response
+
+    @staticmethod
+    def _error_text(exc: BaseException) -> str:
+        if isinstance(exc, RetryError):
+            last = exc.last_attempt.exception()
+            inner = _safe_error_text(parse_http_error(last)) if isinstance(last, HttpError) \
+                else f"network error: {type(last).__name__}"
+            return f"gave up after retries: {inner}"
+        if isinstance(exc, HttpError):
+            return _safe_error_text(parse_http_error(exc))
+        return f"{type(exc).__name__}: {exc}"
+
+    def _fail(self, message: str) -> None:
+        self.summary.failed += 1
+        self.summary.errors.append(message)
+        logger.error(message)
+        self.out(f"  FAILED: {message}")
+
+    def ensure_playlist(self, rule: PlaylistRule) -> Optional[str]:
+        row = get_playlist(self.conn, rule.name)
+        if row is not None:
+            return row["youtube_playlist_id"]
+        body = {
+            "snippet": {"title": rule.name},
+            "status": {"privacyStatus": rule.privacy},
+        }
+        try:
+            response = self._call(
+                lambda: self.youtube.playlists().insert(part="snippet,status", body=body),
+                self.config.quota.playlist_insert_cost,
+                f"creating playlist '{rule.name}'",
+            )
+        except (HttpError, RetryError) as exc:
+            self._fail(f"could not create playlist '{rule.name}': {self._error_text(exc)}")
+            return None
+        playlist_id = response.get("id") if isinstance(response, dict) else None
+        if not playlist_id:
+            self._fail(f"playlists.insert for '{rule.name}' returned no id")
+            return None
+        upsert_playlist(self.conn, rule.name, playlist_id)
+        self.summary.playlists_created.append(rule.name)
+        self.out(f"Created playlist '{rule.name}' ({rule.privacy}).")
+        return playlist_id
+
+    def add_members(self, plan: PlaylistPlan, playlist_id: str) -> None:
+        name = plan.rule.name
+        added = _added_video_ids(self.conn, name)
+        for video in plan.members:
+            if video.id in added:
+                continue
+            position = _target_position(plan.members, added, video)
+            add_playlist_membership(self.conn, video.id, name, added=False, position=position)
+            body = {
+                "snippet": {
+                    "playlistId": playlist_id,
+                    "position": position,
+                    "resourceId": {"kind": "youtube#video", "videoId": video.youtube_video_id},
+                }
+            }
+            try:
+                self._call(
+                    lambda: self.youtube.playlistItems().insert(part="snippet", body=body),
+                    self.config.quota.playlist_item_insert_cost,
+                    f"adding row {video.id} to '{name}'",
+                )
+            except (HttpError, RetryError) as exc:
+                self._fail(f"could not add row {video.id} to '{name}': {self._error_text(exc)}")
+                if isinstance(exc, HttpError) and parse_http_error(exc).reason == "playlistNotFound":
+                    self.out(f"  Playlist '{name}' ({playlist_id}) no longer exists on YouTube; "
+                             "skipping its remaining adds. Remove its row from the playlists "
+                             "table to have it re-created.")
+                    return
+                continue
+            record_playlist_item_added(self.conn, video.id, name, position)
+            added.add(video.id)
+            self.summary.added += 1
+            self.out(f"Added row {video.id} to '{name}' at position {position}.")
+
+    def mark_playlisted(self, rules: dict[str, PlaylistRule]) -> None:
+        added_by_playlist = {name: _added_video_ids(self.conn, name) for name in rules}
+        for video in _eligible_videos(self.conn):
+            if video.status != VideoStatus.UPLOADED:
+                continue
+            matching = [r.name for r in rules.values() if _match_rule(r, video) is not None]
+            if matching and all(video.id in added_by_playlist[n] for n in matching):
+                transition_video_status(self.conn, video.id, VideoStatus.PLAYLISTED)
+                self.summary.marked_playlisted += 1
+
+
+def run_curation(
+    conn,
+    config: Config,
+    tracker: QuotaTracker,
+    youtube_factory: Callable[[], Any],
+    rules: dict[str, PlaylistRule],
+    *,
+    out: Printer = print,
+    sleep: Optional[Callable[[float], None]] = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> CurationSummary:
+    """Create playlists, add members in date order, mark PLAYLISTED.
+
+    ``youtube_factory`` is called only when the first API call is needed, so a
+    run with nothing to do needs no credentials and makes no calls.
+    """
+    runner = _Runner(conn, config, tracker, youtube_factory, out, sleep, max_attempts)
+    plan = build_plan(conn, rules, config=config)
     try:
-        config = load_config(args.config_path)
-    except ConfigError as e:
-        sys.stderr.write(f"Configuration error:\n{e}\n")
-        return 1
-
-    rules_file = Path(__file__).parent / "rules.yaml"
-
-    # Non-dry-run mode is NOT implemented yet — for now, always treat as dry run
-    if not args.dry_run:
-        print("Error: The --no-dry-run (or non-dry-run) mode of 'photos2yt curate' is not yet implemented.")
-        sys.stderr.write("This command currently only supports --dry-run.\n")
-        return 1
-
-    try:
-        # Call curate_plan directly — its return value is now properly used.
-        # We use _ensure_config internally if no config was passed, so conn=None defaults to that behavior.
-        plan = curate_plan(config=config, rules_file=rules_file)
-        
-        # Format and print using the plan's properties
-        print(_format_plan_for_output(plan))
-
-        # Return success (0) — dry run never fails
-        return 0
-    except RuntimeError as e:
-        sys.stderr.write(f"Rules validation error:\n{e}\n")
-        return 1
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(main())
+        if not plan.is_empty and tracker.is_exhausted():
+            raise _QuotaStop("today's quota is already marked exhausted")
+        for p in plan.playlists:
+            if not p.to_add:
+                continue
+            playlist_id = runner.ensure_playlist(p.rule)
+            if playlist_id is None:
+                continue
+            runner.add_members(p, playlist_id)
+    except _QuotaStop as stop:
+        runner.summary.quota_stopped = True
+        out(f"Stopping: {stop}. Remaining adds will run after the quota resets "
+            f"(in about {tracker.seconds_until_reset() / 3600:.1f} h).")
+    runner.mark_playlisted(rules)
+    s = runner.summary
+    out(f"Curation done: {len(s.playlists_created)} playlist(s) created, {s.added} video(s) added, "
+        f"{s.failed} failure(s), {s.marked_playlisted} video(s) now PLAYLISTED.")
+    return s

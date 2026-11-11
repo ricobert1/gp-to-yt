@@ -1,799 +1,781 @@
-"""Unit tests for photos2yt curator module (Task 7A)."""
+"""Tests for photos2yt.curator (Task 7) and `photos2yt curate`.
 
-import os
-from datetime import timezone, timedelta
+No real API calls: a FakeYouTube records every call and fails the test on any
+resource other than playlists/playlistItems (so search.list can never be used).
+Every rules file lives under tmp_path; nothing is written inside the package.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
-import sys
+from typing import Any, Optional
 
+import httplib2
 import pytest
+from googleapiclient.errors import HttpError
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "photos2yt"))
-
-from pathlib import Path
-
-from photos2yt.config import Config, load_config
-from photos2yt.db import get_connection, init_db, insert_video, VideoRecord, add_playlist_membership
+from photos2yt import cli
+from photos2yt.config import Config, PathsConfig, QuotaConfig, YouTubeConfig
 from photos2yt.curator import (
     PlaylistRule,
-    _build_playlist_rules,
-    _match_rule,
-    _match_title_keyword,
-    _match_tags_keyword,
-    _compute_target_positions,
+    RulesError,
     build_plan,
     curate_dry_run,
+    load_rules,
+    resolve_rules_path,
+    run_curation,
+    _match_rule,
 )
+from photos2yt.db import (
+    VideoRecord,
+    get_connection,
+    get_playlist,
+    get_playlist_memberships,
+    get_video,
+    init_db,
+    upsert_playlist,
+    record_playlist_item_added,
+)
+from photos2yt.quota import QuotaTracker
+
+PACKAGE_RULES = Path(__file__).resolve().parent.parent / "photos2yt" / "rules.yaml"
+FROZEN_NOW = datetime(2026, 3, 1, 20, 0, tzinfo=timezone.utc)
+
+XMAS_RULES = """\
+playlists:
+  - name: "Christmas Day Through the Years"
+    privacy: unlisted
+    match:
+      any:
+        - {local_month: 12, local_day: 25}
+"""
 
 
-def get_example_config() -> Config:
-    """Load the example configuration file."""
-    return load_config(Path(__file__).parent.parent / "photos2yt/config.yaml.example")
+# ---------------------------------------------------------------------------
+# Fixtures and helpers
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def package_rules_untouched():
+    """No test may create or change photos2yt/rules.yaml."""
+    def snapshot():
+        return PACKAGE_RULES.read_bytes() if PACKAGE_RULES.exists() else None
+    before = snapshot()
+    yield
+    assert snapshot() == before, "a test wrote to photos2yt/rules.yaml"
 
 
-# =============================================================================
-# Rule matching tests
-# =============================================================================
+def make_config(tmp_path: Path, *, unit_limit: int = 10_000, rules: Optional[Path] = None,
+                config_path: Optional[Path] = None) -> Config:
+    return Config(
+        paths=PathsConfig(
+            staging_dir=tmp_path,
+            db_path=tmp_path / "queue.db",
+            credentials=tmp_path / "credentials.json",
+            token=tmp_path / "token.json",
+            rules=rules,
+        ),
+        timezone="America/New_York",
+        youtube=YouTubeConfig(
+            privacy="unlisted", category_id="22", made_for_kids=False,
+            title_template="{date} - {title}", default_title="Family Video",
+        ),
+        quota=QuotaConfig(
+            daily_unit_limit=unit_limit, upload_cost_units=1600,
+            playlist_insert_cost=50, playlist_item_insert_cost=50,
+        ),
+        video_extensions=(".mp4",),
+        config_path=config_path,
+    )
 
-@pytest.mark.parametrize("local_date,expected_match", [
-    # Basic Dec 25 match with local_month=12, local_day=25
-    ("2024-12-25", True),
-    # Non-matching date: Jan 1
-    ("2024-01-01", False),
-    # Non-matching date: Dec 24 (different day)
-    ("2024-12-24", False),
-    # Same month, different day
-    ("2024-12-31", False),
+
+@pytest.fixture
+def config(tmp_path) -> Config:
+    return make_config(tmp_path)
+
+
+@pytest.fixture
+def conn():
+    c = init_db(get_connection(":memory:"))
+    yield c
+    c.close()
+
+
+@pytest.fixture
+def tracker(conn, config) -> QuotaTracker:
+    return QuotaTracker(conn, config, clock=lambda: FROZEN_NOW)
+
+
+def write_rules(tmp_path: Path, text: str, name: str = "rules.yaml") -> Path:
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def add_video(conn, *, taken_utc: str, local_date: str, title: str = "Video",
+              status: str = "UPLOADED", yt_id: Optional[str] = "auto",
+              tags: Optional[list[str]] = None) -> int:
+    key = f"{taken_utc}|{title}|{local_date}|{status}"
+    sha = hashlib.sha256(key.encode()).hexdigest()
+    cur = conn.execute(
+        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
+        "taken_utc, taken_local_date, title, tags_json, youtube_video_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (f"/staging/{sha[:12]}.mp4", sha, 1024, status, "2024-01-01T00:00:00Z",
+         "2024-01-01T00:00:00Z", taken_utc, local_date, title,
+         json.dumps(tags) if tags is not None else None,
+         None if yt_id is None else (f"yt-{sha[:8]}" if yt_id == "auto" else yt_id)),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def record(conn, video_id: int) -> VideoRecord:
+    return get_video(conn, video_id)
+
+
+def http_error(status: int, reason: Optional[str], message: str = "error") -> HttpError:
+    errors = [{"reason": reason, "domain": "youtube", "message": message}] if reason else []
+    body = json.dumps({"error": {"code": status, "message": message, "errors": errors}})
+    return HttpError(httplib2.Response({"status": status}), body.encode())
+
+
+class FakeRequest:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def execute(self):
+        return self._fn()
+
+
+class FakeYouTube:
+    """Records calls. ``item_script`` maps a YouTube video id to a list of
+    outcomes (exceptions to raise, or None for success), consumed in order."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+        self.item_script: dict[str, list[Any]] = {}
+        self.playlist_script: list[Any] = []
+        self._next_pl = 0
+
+    def __getattr__(self, name):  # search(), videos(), channels(), ... are forbidden
+        raise AssertionError(f"curator must not use youtube.{name}()")
+
+    def playlists(self):
+        fake = self
+
+        class _Playlists:
+            def insert(self, part, body):
+                def run():
+                    fake.calls.append(("playlists.insert", {"part": part, "body": body}))
+                    if fake.playlist_script:
+                        outcome = fake.playlist_script.pop(0)
+                        if isinstance(outcome, BaseException):
+                            raise outcome
+                    fake._next_pl += 1
+                    return {"id": f"PL{fake._next_pl}"}
+                return FakeRequest(run)
+
+            def __getattr__(self, name):
+                raise AssertionError(f"curator must not use playlists().{name}()")
+        return _Playlists()
+
+    def playlistItems(self):
+        fake = self
+
+        class _Items:
+            def insert(self, part, body):
+                def run():
+                    fake.calls.append(("playlistItems.insert", {"part": part, "body": body}))
+                    vid = body["snippet"]["resourceId"]["videoId"]
+                    script = fake.item_script.get(vid)
+                    if script:
+                        outcome = script.pop(0)
+                        if isinstance(outcome, BaseException):
+                            raise outcome
+                    return {"id": f"item-{vid}"}
+                return FakeRequest(run)
+
+            def __getattr__(self, name):
+                raise AssertionError(f"curator must not use playlistItems().{name}()")
+        return _Items()
+
+    def item_inserts(self) -> list[tuple[str, str, int]]:
+        """(playlistId, videoId, position) per playlistItems.insert attempt."""
+        out = []
+        for name, kw in self.calls:
+            if name == "playlistItems.insert":
+                s = kw["body"]["snippet"]
+                out.append((s["playlistId"], s["resourceId"]["videoId"], s["position"]))
+        return out
+
+
+class Factory:
+    def __init__(self, youtube):
+        self.youtube = youtube
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.youtube
+
+
+def run(conn, config, tracker, youtube, rules, **kw):
+    lines: list[str] = []
+    factory = Factory(youtube)
+    summary = run_curation(conn, config, tracker, factory, rules, out=lines.append,
+                           sleep=lambda s: None, **kw)
+    return summary, factory, lines
+
+
+def xmas_rules(tmp_path) -> dict[str, PlaylistRule]:
+    return load_rules(write_rules(tmp_path, XMAS_RULES))
+
+
+def units_today(tracker: QuotaTracker, config: Config) -> int:
+    return config.quota.daily_unit_limit - tracker.remaining()
+
+
+# ---------------------------------------------------------------------------
+# Rule matching
+# ---------------------------------------------------------------------------
+
+def _video(**kw) -> VideoRecord:
+    base = dict(id=1, source_path="/s/a.mp4", sha256="x", size_bytes=1, status="UPLOADED",
+                created_at="t", updated_at="t")
+    base.update(kw)
+    return VideoRecord.from_row(base)
+
+
+XMAS = PlaylistRule("Xmas", "unlisted", {"any": [{"local_month": 12, "local_day": 25}]})
+
+
+@pytest.mark.parametrize("local_date,expected", [
+    ("2024-12-25", True), ("2024-01-01", False), ("2024-12-24", False), ("2024-12-31", False),
+    (None, False), ("garbage", False),
 ])
-def test_date_rule_match(local_date: str, expected_match: bool):
-    """Test that date-based rules match based on taken_local_date only."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    # Insert a video with the given local date
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
-        "taken_local_date, taken_utc, title, tags_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (f"/staging/video_{local_date}.mp4", f"sha256:{local_date}", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", local_date,
-         f"2024-{local_date.split('-')[1]}-{local_date.split('-')[2]}T08:00:00Z",
-         "Test Video", '["summer"]'),
-    )
-    conn.commit()
-
-    rule = PlaylistRule(name="test_playlist", privacy="unlisted", match={
-        "any": [{"local_month": 12, "local_day": 25}]
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED')")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-    assert len(video_records) == 1
-
-    result = _match_rule(rule, video_records[0])
-    assert (result is not None) == expected_match
-
-
-def test_dec24_eastern_8pm_does_not_match_dec25_rule():
-    """Edge case: A video taken at 8 PM Eastern on Dec 24 must NOT match a Dec 25 rule.
-
-    Even though UTC date is Dec 25, the local date (Eastern time) is still Dec 24.
-    The matching logic uses taken_local_date from the database, not UTC.
-    """
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    # A video recorded at 8 PM Eastern on Dec 24
-    # In Eastern Time (EST/EDT), this is still Dec 24 locally
-    taken_utc = "2024-12-25T03:00:00Z"  # 8 PM EST = 3 AM UTC next day
-    taken_local_date = "2024-12-24"  # But in Eastern local time, it's still Dec 24
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
-        "taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/evening_video.mp4", "sha256:dec24eve", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", taken_utc,
-         taken_local_date, "Evening video"),
-    )
-    conn.commit()
-
-    # A rule that says "Christmas Day" (Dec 25) should NOT match this video
-    rule = PlaylistRule(name="christmas_playlist", privacy="unlisted", match={
-        "any": [{"local_month": 12, "local_day": 25}]
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED')")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-    assert len(video_records) == 1
-
-    result = _match_rule(rule, video_records[0])
-    # Must NOT match — the local date is Dec 24, not Dec 25
-    assert result is None
-
-
-def test_dec24_eastern_morning_does_match_dec25_rule():
-    """A video taken at 10 AM Eastern on Dec 25 SHOULD match a Dec 25 rule.
-
-    The local date is Dec 25, so it matches the Christmas Day rule.
-    """
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    # A video recorded at 10 AM Eastern on Dec 25
-    taken_utc = "2024-12-25T15:00:00Z"  # 10 AM EST = 3 PM UTC (same day in Dec)
-    taken_local_date = "2024-12-25"
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
-        "taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/morning_video.mp4", "sha256:dec25am", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", taken_utc,
-         taken_local_date, "Morning video"),
-    )
-    conn.commit()
-
-    rule = PlaylistRule(name="christmas_playlist", privacy="unlisted", match={
-        "any": [{"local_month": 12, "local_day": 25}]
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED')")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-    assert len(video_records) == 1
-
-    result = _match_rule(rule, video_records[0])
-    # Must match — the local date is Dec 25
-    assert result is not None
-
-
-def test_whole_word_matching():
-    """Test that keyword matching uses word boundaries (whole-word only)."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmas_video.mp4", "sha256:xmas1", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmas Day celebration"),
-    )
-    conn.commit()
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmassy_video.mp4", "sha256:christmas1", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmassy decorations"),
-    )
-    conn.commit()
-
-    # Match for "Christmas" should match the first video but NOT the second (which contains "Christmassy")
-    rule = PlaylistRule(name="christmas_playlist", privacy="unlisted", match={
-        "any": [{"title_contains_any": ["Christmas"]}]
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED') ORDER BY source_path")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-    assert len(video_records) == 2
-
-    # First video: "Christmas Day celebration" — should match
-    result1 = _match_rule(rule, video_records[0])
-    assert result1 is not None, f"Expected 'Christmas' to match 'Christmas Day celebration', got {result1}"
-
-    # Second video: "Christmassy decorations" — should NOT match (whole-word only)
-    result2 = _match_rule(rule, video_records[1])
-    assert result2 is None, f"'Christmas' should not match 'Christmassy decorations', but matched with {result2}"
-
-
-def test_title_keyword_case_insensitive():
-    """Test that title_contains_any matching is case-insensitive."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/video.mp4", "sha256:case1", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "My Christmas vacation video"),
-    )
-    conn.commit()
-
-    rule = PlaylistRule(name="christmas_playlist", privacy="unlisted", match={
-        "any": [{"title_contains_any": ["CHRISTMAS"]}]  # uppercase keyword
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED')")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-
-    result = _match_rule(rule, video_records[0])
-    assert result is not None
-
-
-def test_tags_keyword_matching():
-    """Test that tags_contain_any performs case-insensitive whole-word matching on tags."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title, tags_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmas_video.mp4", "sha256:tag1", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmas video", '["christmas", "vacation"]'),
-    )
-    conn.commit()
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title, tags_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmassy_video.mp4", "sha256:tag2", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmassy video", '["christmassy"]'),  # note the extra 's'
-    )
-    conn.commit()
-
-    rule = PlaylistRule(name="christmas_playlist", privacy="unlisted", match={
-        "any": [{"tags_contain_any": ["Christmas"]}]  # uppercase, should match lowercase tags
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED') ORDER BY source_path")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-    assert len(video_records) == 2
-
-    # First video: tags=["christmas", "vacation"] — should match "Christmas" (case-insensitive, whole-word)
-    result1 = _match_rule(rule, video_records[0])
-    assert result1 is not None, f"'Christmas' should match tag 'christmas'"
-
-    # Second video: tags=["christmassy"] — should NOT match (whole-word boundary)
-    result2 = _match_rule(rule, video_records[1])
-    assert result2 is None, f"'Christmas' should not match tag 'christmassy'"
-
-
-# =============================================================================
-# any vs all tests
-# =============================================================================
-
-def test_any_conditions():
-    """Test that 'any' conditions work — if at least one condition matches, the rule matches."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmas.mp4", "sha256:christmas", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmas video"),
-    )
-    conn.commit()
-
-    rule = PlaylistRule(name="christmas_playlist", privacy="unlisted", match={
-        "any": [
-            {"local_month": 12, "local_day": 25},   # matches
-            {"local_month": 1, "local_day": 1},     # does not match
-        ]
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED')")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-
-    result = _match_rule(rule, video_records[0])
-    assert result is not None, "The 'any' rule should match because at least one condition matches"
-
-
-def test_all_conditions():
-    """Test that 'all' conditions work — all conditions must match."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmas.mp4", "sha256:christmas", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmas video"),
-    )
-    conn.commit()
-
-    rule = PlaylistRule(name="christmas_playlist", privacy="unlisted", match={
-        "all": [
-            {"local_month": 12, "local_day": 25},   # matches
-            {"title_contains_any": ["Christmas"]},   # also matches
-        ]
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED')")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-
-    result = _match_rule(rule, video_records[0])
-    assert result is not None, "The 'all' rule should match because all conditions are satisfied"
-
-
-def test_all_conditions_partial_fail():
-    """Test that 'all' returns None when at least one condition fails."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmas.mp4", "sha256:christmas", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmas video"),
-    )
-    conn.commit()
-
-    rule = PlaylistRule(name="christmas_playlist", privacy="unlisted", match={
-        "all": [
-            {"local_month": 12, "local_day": 25},   # matches
-            {"local_month": 1, "local_day": 1},     # does NOT match
-        ]
-    })
-
-    cursor = conn.execute("SELECT * FROM videos WHERE status IN ('UPLOADED', 'PLAYLISTED')")
-    video_records = [VideoRecord.from_row(row) for row in cursor.fetchall()]
-
-    result = _match_rule(rule, video_records[0])
-    assert result is None, "The 'all' rule should NOT match because one condition fails"
-
-
-# =============================================================================
-# Validation tests
-# =============================================================================
-
-def test_validation_duplicate_playlist_name():
-    """Test that duplicate playlist names are rejected."""
-    rules_path = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_path, "w") as f:
-        f.write("""playlists:
-  - name: "Christmas"
-    privacy: unlisted
-  - name: "Christmas"
-    privacy: unlisted
-""")
-
-    try:
-        _build_playlist_rules(rules_path)
-        assert False, "Should have raised RuntimeError for duplicate names"
-    except RuntimeError as e:
-        # The implementation checks match field before duplicate detection.
-        # This is a valid design choice: schema errors (missing/invalid match) are reported
-        # before business-rule errors (duplicate name). Both behaviors are defensible;
-        # we document the actual order here.
-        assert "match" in str(e).lower() or "duplicate" in str(e).lower(), \
-            f"Unexpected error: {e}"
-
-
-def test_validation_empty_match():
-    """Test that a condition with no recognized fields is rejected."""
-    rules_path = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_path, "w") as f:
-        f.write("""playlists:
-  - name: "test"
-    privacy: unlisted
-    match:
-      any:
-        - {unknown_field: 1}
-""")
-
-    try:
-        _build_playlist_rules(rules_path)
-        assert False, "Should have raised RuntimeError for empty/unknown condition"
-    except RuntimeError as e:
-        assert "no recognized fields" in str(e).lower() or "unexpected field name" in str(e).lower()
-
-
-def test_validation_unknown_condition():
-    """Test that an unknown field name is rejected."""
-    rules_path = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_path, "w") as f:
-        f.write("""playlists:
-  - name: "test"
-    privacy: unlisted
-    match:
-      any:
-        - {unknown_field: 1}
-""")
-
-    try:
-        _build_playlist_rules(rules_path)
-        assert False, "Should have raised RuntimeError for unknown field"
-    except RuntimeError as e:
-        # Unknown fields should be treated as having no recognized fields
-        assert "no recognized fields" in str(e).lower() or "unexpected field name" in str(e).lower()
-
-
-def test_validation_invalid_local_month():
-    """Test that local_month out of range is rejected."""
-    rules_path = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_path, "w") as f:
-        f.write("""playlists:
-  - name: "test"
-    privacy: unlisted
-    match:
-      any:
-        - {local_month: 13}
-""")
-
-    try:
-        _build_playlist_rules(rules_path)
-        assert False, "Should have raised RuntimeError for invalid local_month"
-    except RuntimeError as e:
-        assert "invalid 'local_month'" in str(e)
-
-
-def test_validation_invalid_local_day():
-    """Test that local_day out of range is rejected."""
-    rules_path = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_path, "w") as f:
-        f.write("""playlists:
-  - name: "test"
-    privacy: unlisted
-    match:
-      any:
-        - {local_day: 32}
-""")
-
-    try:
-        _build_playlist_rules(rules_path)
-        assert False, "Should have raised RuntimeError for invalid local_day"
-    except RuntimeError as e:
-        assert "invalid 'local_day'" in str(e)
-
-
-def test_validation_non_string_name():
-    """Test that a non-string name is rejected."""
-    rules_path = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_path, "w") as f:
-        f.write("""playlists:
-  - name: 12345
-    privacy: unlisted
-""")
-
-    try:
-        _build_playlist_rules(rules_path)
-        assert False, "Should have raised RuntimeError for non-string name"
-    except RuntimeError as e:
-        assert "must be a non-empty string" in str(e)
-
-
-def test_validation_empty_name():
-    """Test that an empty name is rejected."""
-    rules_path = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_path, "w") as f:
-        f.write("""playlists:
-  - name: ""
-    privacy: unlisted
-""")
-
-    try:
-        _build_playlist_rules(rules_path)
-        assert False, "Should have raised RuntimeError for empty name"
-    except RuntimeError as e:
-        assert "must be a non-empty string" in str(e)
-
-
-def test_validation_invalid_privacy():
-    """Test that an invalid privacy value is rejected."""
-    rules_path = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_path, "w") as f:
-        f.write("""playlists:
-  - name: "test"
-    privacy: confidential
-""")
-
-    try:
-        _build_playlist_rules(rules_path)
-        assert False, "Should have raised RuntimeError for invalid privacy"
-    except RuntimeError as e:
-        assert "invalid 'privacy'" in str(e)
-
-
-# =============================================================================
-# Ordering and position tests
-# =============================================================================
-
-def test_ordering_and_positions():
-    """Test that videos are ordered by (taken_utc, id) and target positions computed correctly."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    # Create 5 videos with different taken_utc values on the same date
-    for i in range(1, 6):
-        cursor = conn.execute(
-            "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
-            "taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (f"/staging/video_{i}.mp4", f"sha256:video{i}", 1024 * 1024,
-             "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z",
-            f"2023-12-25T{(i+7):02d}:00:00Z", "2023-12-25", f"Video {i}"),
-        )
-    conn.commit()
-
-    # A video added later (higher id) with an earlier taken_utc should still get its correct position
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
-        "taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/late_added_older.mp4", "sha256:late_older", 1024 * 1024,
-         "UPLOADED", "2024-01-02T00:00:00Z", "2024-01-02T00:00:00Z",
-         "2023-12-25T02:00:00Z", "2023-12-25", "Late added older video"),
-    )
-    conn.commit()
-
-    config = get_example_config()
-    rules_file = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_file, "w") as f:
-        f.write("""playlists:
-  - name: "Christmas Day Through the Years"
-    privacy: unlisted
-    match:
-      any:
-        - {local_month: 12, local_day: 25}
-""")
-
-    plan = curate_dry_run(config, rules_file, conn=conn)
-
-    assert len(plan.playlists_to_create) == 1
-    assert "Christmas Day Through the Years" in plan.playlists_to_create
-
-    videos_added = plan.videos_to_add
-    # We have 6 videos total matching this rule (5 original + 1 late-added)
-    # They should be sorted by taken_utc ascending, then id ascending
-    # Video 0: Dec 25 08:00 UTC -> position 0
-    # Video 1: Dec 25 09:00 UTC -> position 1
-    # Video 2: Dec 25 10:00 UTC -> position 2
-    # Video 3: Dec 25 11:00 UTC -> position 3
-    # Video 4: Dec 25 12:00 UTC -> position 4
-    # Late added older (Dec 25 02:00 UTC, id higher): position 5
-    assert len(videos_added) == 6
-
-    positions = {vid_id: pos for pl_name, vid_id, pos in videos_added}
-    # SQLite auto-assigns IDs: video_a=1, video_b=2, ..., late_added_older=6
-    # Sorted by (taken_utc ASC, id ASC):
-    #   id=6 (02:00 UTC) -> position 0
-    #   id=1 (08:00 UTC) -> position 1
-    #   id=2 (09:00 UTC) -> position 2
-    #   id=3 (10:00 UTC) -> position 3
-    #   id=4 (11:00 UTC) -> position 4  
-    #   id=5 (12:00 UTC) -> position 5
-    assert positions[6] == 0   # late_added_older (id=6, earliest time) -> position 0
-    assert positions[1] == 1   # video_a (id=1) -> position 1
-    assert positions[2] == 2   # video_b (id=2) -> position 2
-    assert positions[3] == 3   # video_c (id=3) -> position 3
-    assert positions[4] == 4   # video_d (id=4) -> position 4
-    assert positions[5] == 5   # video_e (id=5) -> position 5
-
-
-def test_late_added_older_video_position():
-    """Test that a late-added video with an older date lands at the correct index.
-
-    Video A: Dec 25 08:00 UTC, id=100
-    Video B (late added): Dec 25 06:00 UTC, id=200 (added after A was processed)
-
-    Order by (taken_utc, id): Video B comes first (earlier time), then Video A.
-    So Video B should be at position 0, Video A at position 1.
-    """
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    # First video: Dec 25 08:00 UTC, id=100
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
-        "taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/video_a.mp4", "sha256:a100", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z",
-         "2023-12-25T08:00:00Z", "2023-12-25", "Video A"),
-    )
-    conn.commit()
-
-    # Second video (late added): Dec 25 06:00 UTC, id=200 — older time but higher id
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
-        "taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/video_b.mp4", "sha256:b200", 1024 * 1024,
-         "UPLOADED", "2024-01-02T00:00:00Z", "2024-01-02T00:00:00Z",  # created later (late added)
-         "2023-12-25T06:00:00Z", "2023-12-25", "Video B"),
-    )
-    conn.commit()
-
-    config = get_example_config()
-    rules_file = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_file, "w") as f:
-        f.write("""playlists:
-  - name: "Christmas Day Through the Years"
-    privacy: unlisted
-    match:
-      any:
-        - {local_month: 12, local_day: 25}
-""")
-
-    plan = curate_dry_run(config, rules_file, conn=conn)
-
-    assert len(plan.playlists_to_create) == 1
-    videos_added = plan.videos_to_add
-    assert len(videos_added) == 2
-
-    # Video B (id=200, taken_utc="2023-12-25T06:00:00Z") comes before Video A (id=100, taken_utc="2023-12-25T08:00:00Z")
-    # So Video B is at position 0, Video A is at position 1
-    positions = {vid_id: pos for pl_name, vid_id, pos in videos_added}
-    assert positions[2] == 0   # Video B (id=2, older time) -> position 0
-    assert positions[1] == 1   # Video A (id=1) -> position 1
-
-
-# =============================================================================
-# Empty plan tests
-# =============================================================================
-
-def test_empty_plan_on_re_run():
-    """Test that re-running the planner after everything is added produces an empty plan."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, "
-        "taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmas.mp4", "sha256:xmas", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmas video"),
-    )
-    conn.commit()
-
-    # First, add the membership (simulating that it's already been added)
-    from photos2yt.db import upsert_playlist
-
-    cursor = conn.execute("INSERT INTO playlists (name, youtube_playlist_id) VALUES (?, ?)",
-                          ("Christmas Day Through the Years", "PL_test123"))
-    conn.commit()
-
-    add_playlist_membership(conn=conn, video_id=1, playlist_name="Christmas Day Through the Years", added=True)
-    conn.commit()
-
-    config = get_example_config()
-    rules_file = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_file, "w") as f:
-        f.write("""playlists:
-  - name: "Christmas Day Through the Years"
-    privacy: unlisted
-    match:
-      any:
-        - {local_month: 12, local_day: 25}
-""")
-
-    plan = curate_dry_run(config, rules_file, conn=conn)
-
-    # The video is already added, so the plan should be empty
+def test_date_rule_uses_local_date(local_date, expected):
+    assert (_match_rule(XMAS, _video(taken_local_date=local_date)) is not None) == expected
+
+
+def test_dec24_8pm_eastern_does_not_match_dec25_rule():
+    # 8 PM EST on Dec 24 is Dec 25 03:00 UTC; the local date decides.
+    v = _video(taken_utc="2024-12-25T01:00:00Z", taken_local_date="2024-12-24")
+    assert _match_rule(XMAS, v) is None
+
+
+def test_dec25_morning_eastern_matches():
+    v = _video(taken_utc="2024-12-25T15:00:00Z", taken_local_date="2024-12-25")
+    assert _match_rule(XMAS, v) is not None
+
+
+def test_dec24_edge_with_dates_computed_by_ingest():
+    """8 PM Eastern on Dec 24 (= Dec 25 01:00 UTC) gets local date Dec 24 from the
+    ingest date helper, and so does not match the Dec 25 rule."""
+    from photos2yt.metadata import compute_dates
+    epoch = datetime(2024, 12, 25, 1, 0, tzinfo=timezone.utc).timestamp()
+    taken_utc, local_date, _ = compute_dates(epoch, "America/New_York")
+    assert local_date == "2024-12-24"
+    assert _match_rule(XMAS, _video(taken_utc=taken_utc, taken_local_date=local_date)) is None
+
+
+def test_month_only_and_year_conditions():
+    december = PlaylistRule("Dec", "unlisted", {"any": [{"local_month": 12}]})
+    y2023 = PlaylistRule("2023", "unlisted", {"any": [{"local_year": 2023}]})
+    assert _match_rule(december, _video(taken_local_date="2021-12-03")) is not None
+    assert _match_rule(december, _video(taken_local_date="2021-11-30")) is None
+    assert _match_rule(y2023, _video(taken_local_date="2023-06-01")) is not None
+    assert _match_rule(y2023, _video(taken_local_date="2024-06-01")) is None
+
+
+def test_fields_within_one_condition_are_anded():
+    rule = PlaylistRule("r", "unlisted", {"any": [{"local_month": 12, "title_contains_any": ["tree"]}]})
+    assert _match_rule(rule, _video(taken_local_date="2020-12-01", title="The tree")) is not None
+    assert _match_rule(rule, _video(taken_local_date="2020-11-01", title="The tree")) is None
+    assert _match_rule(rule, _video(taken_local_date="2020-12-01", title="Snow")) is None
+
+
+def test_whole_word_case_insensitive_title_and_tags():
+    title_rule = PlaylistRule("t", "unlisted", {"any": [{"title_contains_any": ["CHRISTMAS"]}]})
+    assert _match_rule(title_rule, _video(title="My Christmas morning")) is not None
+    assert _match_rule(title_rule, _video(title="Christmassy decorations")) is None
+    tag_rule = PlaylistRule("g", "unlisted", {"any": [{"tags_contain_any": ["Christmas Day"]}]})
+    assert _match_rule(tag_rule, _video(tags_json='["christmas day", "family"]')) is not None
+    assert _match_rule(tag_rule, _video(tags_json='["christmassy"]')) is None
+    assert _match_rule(tag_rule, _video(tags_json=None)) is None
+
+
+def test_any_and_all():
+    any_rule = PlaylistRule("a", "unlisted", {"any": [{"local_month": 1, "local_day": 1},
+                                                      {"local_month": 12, "local_day": 25}]})
+    all_rule = PlaylistRule("b", "unlisted", {"all": [{"local_month": 12, "local_day": 25},
+                                                      {"title_contains_any": ["Christmas"]}]})
+    v = _video(taken_local_date="2024-12-25", title="Christmas video")
+    assert _match_rule(any_rule, v) is not None
+    assert _match_rule(all_rule, v) is not None
+    assert _match_rule(all_rule, _video(taken_local_date="2024-12-25", title="Other")) is None
+
+
+# ---------------------------------------------------------------------------
+# Rules validation and path resolution
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,needle", [
+    ('playlists:\n  - {name: "A", privacy: unlisted, match: {any: [{local_month: 1}]}}\n'
+     '  - {name: "A", privacy: unlisted, match: {any: [{local_month: 1}]}}\n', "duplicate"),
+    ("playlists:\n  - {name: t, privacy: unlisted, match: {any: [{unknown_field: 1}]}}\n",
+     "unexpected field name"),
+    ("playlists:\n  - {name: t, privacy: unlisted, match: {any: [{}]}}\n", "no recognized fields"),
+    ("playlists:\n  - {name: t, privacy: unlisted, match: {any: [{local_month: 13}]}}\n",
+     "invalid 'local_month'"),
+    ("playlists:\n  - {name: t, privacy: unlisted, match: {all: [{local_day: 32}]}}\n",
+     "invalid 'local_day'"),
+    ("playlists:\n  - {name: t, privacy: unlisted, match: {any: [{local_month: true}]}}\n",
+     "invalid 'local_month'"),
+    ("playlists:\n  - {name: 12345, privacy: unlisted}\n", "must be a non-empty string"),
+    ('playlists:\n  - {name: "", privacy: unlisted}\n', "must be a non-empty string"),
+    ("playlists:\n  - {name: t, privacy: confidential}\n", "invalid 'privacy'"),
+    ("playlists:\n  - {name: t, privacy: unlisted}\n", "invalid 'match'"),
+    ("playlists:\n  - {name: t, privacy: unlisted, match: {some: []}}\n", "unknown key"),
+    ("playlists:\n  - {name: t, privacy: unlisted, match: {any: []}}\n", "non-empty list"),
+    ("playlists:\n  - {name: t, privacy: unlisted, match: {any: [{title_contains_any: x}]}}\n",
+     "title_contains_any"),
+    ("playlists: 5\n", "must be a list"),
+])
+def test_rules_validation(tmp_path, text, needle):
+    with pytest.raises(RulesError) as exc:
+        load_rules(write_rules(tmp_path, text))
+    assert needle.lower() in str(exc.value).lower()
+
+
+def test_rules_load_ok_and_empty(tmp_path):
+    rules = load_rules(write_rules(tmp_path, XMAS_RULES))
+    assert list(rules) == ["Christmas Day Through the Years"]
+    assert rules["Christmas Day Through the Years"].privacy == "unlisted"
+    assert load_rules(write_rules(tmp_path, "playlists: []\n", "empty.yaml")) == {}
+    assert load_rules(write_rules(tmp_path, "", "blank.yaml")) == {}
+
+
+def test_example_rules_file_is_valid():
+    example = PACKAGE_RULES.with_name("rules.yaml.example")
+    assert load_rules(example) == {}
+
+
+def test_resolve_rules_path(tmp_path):
+    cfg_file = tmp_path / "conf" / "config.yaml"
+    default = make_config(tmp_path, config_path=cfg_file)
+    assert resolve_rules_path(default) == (tmp_path / "conf" / "rules.yaml", False)
+    from_config = make_config(tmp_path, rules=tmp_path / "mine.yaml", config_path=cfg_file)
+    assert resolve_rules_path(from_config) == (tmp_path / "mine.yaml", True)
+    override = tmp_path / "cli.yaml"
+    assert resolve_rules_path(from_config, str(override)) == (override.resolve(), True)
+
+
+def test_config_loader_reads_paths_rules(tmp_path):
+    from photos2yt.config import load_config
+    example = (Path(__file__).resolve().parent.parent / "config.yaml.example").read_text()
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(example.replace("rules: rules.yaml", "rules: my_rules.yaml"))
+    assert load_config(cfg_file).paths.rules == (tmp_path / "my_rules.yaml").resolve()
+    no_rules = "\n".join(l for l in example.splitlines() if not l.strip().startswith("rules:"))
+    cfg_file.write_text(no_rules)
+    assert load_config(cfg_file).paths.rules is None
+
+
+# ---------------------------------------------------------------------------
+# Planning
+# ---------------------------------------------------------------------------
+
+def test_plan_orders_by_date_and_assigns_positions(conn, config, tmp_path):
+    ids = [add_video(conn, taken_utc=f"2023-12-25T{h:02d}:00:00Z", local_date="2023-12-25",
+                     title=f"V{h}") for h in (8, 9, 10)]
+    late_older = add_video(conn, taken_utc="2023-12-25T06:00:00Z", local_date="2023-12-25",
+                           title="late")
+    plan = build_plan(conn, xmas_rules(tmp_path), config)
+    assert plan.playlists_to_create == ["Christmas Day Through the Years"]
+    assert [(v, p) for _, v, p in plan.videos_to_add] == [
+        (late_older, 0), (ids[0], 1), (ids[1], 2), (ids[2], 3)]
+    assert plan.estimated_cost == 50 + 4 * 50
+
+
+def test_plan_ignores_pending_failed_and_rows_without_youtube_id(conn, config, tmp_path):
+    good = add_video(conn, taken_utc="2024-12-25T18:00:00Z", local_date="2024-12-25")
+    add_video(conn, taken_utc="2024-12-25T18:00:00Z", local_date="2024-12-25", title="p",
+              status="PENDING", yt_id=None)
+    add_video(conn, taken_utc="2024-12-25T18:00:00Z", local_date="2024-12-25", title="f",
+              status="FAILED", yt_id=None)
+    add_video(conn, taken_utc="2024-12-25T19:00:00Z", local_date="2024-12-25", title="noid",
+              yt_id=None)
+    plan = build_plan(conn, xmas_rules(tmp_path), config)
+    assert [v for _, v, _ in plan.videos_to_add] == [good]
+
+
+def test_plan_for_existing_playlist_inserts_late_older_video_at_its_date(conn, config, tmp_path):
+    a = add_video(conn, taken_utc="2020-12-25T10:00:00Z", local_date="2020-12-25", title="a")
+    c = add_video(conn, taken_utc="2022-12-25T10:00:00Z", local_date="2022-12-25", title="c")
+    upsert_playlist(conn, "Christmas Day Through the Years", "PLx")
+    record_playlist_item_added(conn, a, "Christmas Day Through the Years", 0)
+    record_playlist_item_added(conn, c, "Christmas Day Through the Years", 1)
+    b = add_video(conn, taken_utc="2021-12-25T10:00:00Z", local_date="2021-12-25", title="b")
+    plan = build_plan(conn, xmas_rules(tmp_path), config)
     assert plan.playlists_to_create == []
-    assert len(plan.videos_to_add) == 0
+    assert plan.videos_to_add == [("Christmas Day Through the Years", b, 1)]
+    assert plan.estimated_cost == 50
 
 
-def test_pending_and_failed_videos_ignored():
-    """Test that videos with PENDING or FAILED status are ignored by the planner."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    # Create a video with UPLOADED status (should be considered)
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/uploaded.mp4", "sha256:up1", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Uploaded video"),
-    )
-    conn.commit()
-
-    # Create a video with PENDING status (should be ignored)
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/pending.mp4", "sha256:up2", 1024 * 1024,
-         "PENDING", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Pending video"),
-    )
-    conn.commit()
-
-    # Create a video with FAILED status (should be ignored)
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/failed.mp4", "sha256:up3", 1024 * 1024,
-         "FAILED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Failed video"),
-    )
-    conn.commit()
-
-    config = get_example_config()
-    rules_file = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_file, "w") as f:
-        f.write("""playlists:
-  - name: "Christmas Day Through the Years"
-    privacy: unlisted
-    match:
-      any:
-        - {local_month: 12, local_day: 25}
-""")
-
-    plan = curate_dry_run(config, rules_file, conn=conn)
-
-    # Only the UPLOADED video should be in the plan
-    assert len(plan.playlists_to_create) == 1
+def test_dry_run_writes_nothing(conn, config, tmp_path):
+    add_video(conn, taken_utc="2024-12-25T18:00:00Z", local_date="2024-12-25")
+    before = list(conn.iterdump())
+    out: list[str] = []
+    plan = curate_dry_run(config, write_rules(tmp_path, XMAS_RULES), conn, out=out.append)
     assert len(plan.videos_to_add) == 1
-    # The only video that should appear is the one with id=1 (the uploaded one)
-    assert plan.videos_to_add[0][1] == 1
+    assert list(conn.iterdump()) == before
+    assert "would create" in out[0]
 
 
-# =============================================================================
-# Dry-run tests
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Running (non-dry-run)
+# ---------------------------------------------------------------------------
 
-def test_dry_run_writes_nothing():
-    """Test that --dry-run does not modify the database or write any files."""
-    conn = get_connection(":memory:")
-    init_db(conn)
+def _xmas_videos(conn) -> list[int]:
+    # Inserted out of date order on purpose.
+    return [
+        add_video(conn, taken_utc="2022-12-25T15:00:00Z", local_date="2022-12-25", title="2022"),
+        add_video(conn, taken_utc="2020-12-25T15:00:00Z", local_date="2020-12-25", title="2020"),
+        add_video(conn, taken_utc="2021-12-25T15:00:00Z", local_date="2021-12-25", title="2021"),
+    ]
 
-    cursor = conn.execute(
-        "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("/staging/christmas.mp4", "sha256:xmas1", 1024 * 1024,
-         "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-         "2024-12-25", "Christmas video"),
-    )
-    conn.commit()
 
-    config = get_example_config()
-    rules_file = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_file, "w") as f:
-        f.write("""playlists:
-  - name: "Christmas Day Through the Years"
+def test_run_creates_playlist_adds_in_date_order_and_marks_playlisted(conn, config, tracker, tmp_path):
+    v2022, v2020, v2021 = _xmas_videos(conn)
+    other = add_video(conn, taken_utc="2021-07-04T15:00:00Z", local_date="2021-07-04", title="July")
+    yt = FakeYouTube()
+    summary, _, _ = run(conn, config, tracker, yt, xmas_rules(tmp_path))
+
+    assert yt.calls[0] == ("playlists.insert", {
+        "part": "snippet,status",
+        "body": {"snippet": {"title": "Christmas Day Through the Years"},
+                 "status": {"privacyStatus": "unlisted"}}})
+    assert get_playlist(conn, "Christmas Day Through the Years")["youtube_playlist_id"] == "PL1"
+    yid = {i: record(conn, i).youtube_video_id for i in (v2020, v2021, v2022)}
+    assert yt.item_inserts() == [("PL1", yid[v2020], 0), ("PL1", yid[v2021], 1),
+                                 ("PL1", yid[v2022], 2)]
+    assert all(kw["part"] == "snippet" for n, kw in yt.calls if n == "playlistItems.insert")
+
+    rows = {(r["video_id"], r["added"], r["position"])
+            for r in get_playlist_memberships(conn, playlist_name="Christmas Day Through the Years")}
+    assert rows == {(v2020, 1, 0), (v2021, 1, 1), (v2022, 1, 2)}
+    for i in (v2020, v2021, v2022):
+        assert record(conn, i).status.value == "PLAYLISTED"
+    assert record(conn, other).status.value == "UPLOADED"  # matches no rule
+
+    assert summary.playlists_created == ["Christmas Day Through the Years"]
+    assert (summary.added, summary.failed, summary.marked_playlisted) == (3, 0, 3)
+    assert units_today(tracker, config) == 50 + 3 * 50
+
+
+def test_rerun_is_idempotent_and_makes_zero_api_calls(conn, config, tracker, tmp_path):
+    _xmas_videos(conn)
+    rules = xmas_rules(tmp_path)
+    run(conn, config, tracker, FakeYouTube(), rules)
+    used = units_today(tracker, config)
+
+    yt = FakeYouTube()
+    summary, factory, _ = run(conn, config, tracker, yt, rules)
+    assert yt.calls == []
+    assert factory.calls == 0  # no client (so no credentials) needed
+    assert summary.api_calls == 0 and summary.added == 0 and summary.failed == 0
+    assert units_today(tracker, config) == used
+
+
+def test_existing_playlist_is_not_recreated_and_late_older_video_goes_to_its_date(
+        conn, config, tracker, tmp_path):
+    v2022, v2020, v2021 = _xmas_videos(conn)
+    rules = xmas_rules(tmp_path)
+    run(conn, config, tracker, FakeYouTube(), rules)
+
+    older = add_video(conn, taken_utc="2019-12-25T15:00:00Z", local_date="2019-12-25", title="2019")
+    middle = add_video(conn, taken_utc="2021-12-25T20:00:00Z", local_date="2021-12-25", title="2021b")
+    yt = FakeYouTube()
+    summary, _, _ = run(conn, config, tracker, yt, rules)
+    assert [c[0] for c in yt.calls] == ["playlistItems.insert"] * 2
+    ins = yt.item_inserts()
+    assert ins == [("PL1", record(conn, older).youtube_video_id, 0),
+                   ("PL1", record(conn, middle).youtube_video_id, 3)]
+    positions = {r["video_id"]: r["position"]
+                 for r in get_playlist_memberships(conn, playlist_name="Christmas Day Through the Years")}
+    assert positions == {older: 0, v2020: 1, v2021: 2, middle: 3, v2022: 4}
+    assert summary.marked_playlisted == 2
+
+
+def test_failed_add_does_not_block_others_and_is_retried_next_run(conn, config, tracker, tmp_path):
+    v2022, v2020, v2021 = _xmas_videos(conn)
+    rules = xmas_rules(tmp_path)
+    yt = FakeYouTube()
+    bad = record(conn, v2020).youtube_video_id
+    yt.item_script[bad] = [http_error(400, "invalidVideo", "bad video")]
+    summary, _, lines = run(conn, config, tracker, yt, rules)
+
+    assert summary.failed == 1 and summary.added == 2
+    # 2020 failed, so 2021 is inserted at 0 and 2022 at 1 (positions follow real state).
+    yid = {i: record(conn, i).youtube_video_id for i in (v2020, v2021, v2022)}
+    assert yt.item_inserts() == [("PL1", yid[v2020], 0), ("PL1", yid[v2021], 0),
+                                 ("PL1", yid[v2022], 1)]
+    m = {r["video_id"]: (r["added"], r["position"])
+         for r in get_playlist_memberships(conn, playlist_name="Christmas Day Through the Years")}
+    assert m[v2020][0] == 0
+    assert record(conn, v2020).status.value == "UPLOADED"
+    assert record(conn, v2021).status.value == "PLAYLISTED"
+    assert any("invalidVideo" in line for line in lines)
+    # The rejected request still counts against quota (conservative).
+    assert units_today(tracker, config) == 50 + 3 * 50
+
+    yt2 = FakeYouTube()
+    summary2, _, _ = run(conn, config, tracker, yt2, rules)
+    assert yt2.item_inserts() == [("PL1", yid[v2020], 0)]
+    assert summary2.added == 1 and summary2.failed == 0
+    positions = {r["video_id"]: r["position"]
+                 for r in get_playlist_memberships(conn, playlist_name="Christmas Day Through the Years")}
+    assert positions == {v2020: 0, v2021: 1, v2022: 2}
+    assert record(conn, v2020).status.value == "PLAYLISTED"
+
+
+def test_transient_errors_are_retried(conn, config, tracker, tmp_path):
+    (v,) = [add_video(conn, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25")]
+    yt = FakeYouTube()
+    yt.item_script[record(conn, v).youtube_video_id] = [http_error(503, "backendError"), None]
+    summary, _, _ = run(conn, config, tracker, yt, xmas_rules(tmp_path))
+    assert summary.added == 1 and summary.failed == 0
+    assert len(yt.item_inserts()) == 2
+
+
+def test_retries_exhausted_counts_as_failure(conn, config, tracker, tmp_path):
+    v = add_video(conn, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25")
+    yt = FakeYouTube()
+    yt.item_script[record(conn, v).youtube_video_id] = [http_error(500, "backendError")] * 10
+    summary, _, _ = run(conn, config, tracker, yt, xmas_rules(tmp_path), max_attempts=3)
+    assert summary.failed == 1 and summary.added == 0
+    assert len(yt.item_inserts()) == 3
+    assert record(conn, v).status.value == "UPLOADED"
+
+
+def test_quota_exceeded_marks_exhausted_and_stops(conn, config, tracker, tmp_path):
+    v2022, v2020, v2021 = _xmas_videos(conn)
+    yt = FakeYouTube()
+    yt.item_script[record(conn, v2021).youtube_video_id] = [http_error(403, "quotaExceeded")]
+    summary, _, _ = run(conn, config, tracker, yt, xmas_rules(tmp_path))
+    assert summary.quota_stopped and summary.failed == 0 and summary.added == 1
+    assert tracker.is_exhausted()
+    assert len(yt.item_inserts()) == 2  # 2020 ok, 2021 quotaExceeded, 2022 never tried
+    assert record(conn, v2020).status.value == "PLAYLISTED"
+    assert record(conn, v2022).status.value == "UPLOADED"
+
+    # While exhausted, a further run makes no calls at all.
+    yt2 = FakeYouTube()
+    summary2, factory, _ = run(conn, config, tracker, yt2, xmas_rules(tmp_path))
+    assert yt2.calls == [] and factory.calls == 0 and summary2.quota_stopped
+
+
+def test_local_quota_counter_stops_before_calling(tmp_path):
+    config = make_config(tmp_path, unit_limit=120)  # playlist (50) + 1 add (50), not 2
+    conn = init_db(get_connection(":memory:"))
+    tracker = QuotaTracker(conn, config, clock=lambda: FROZEN_NOW)
+    _xmas_videos(conn)
+    yt = FakeYouTube()
+    summary, _, _ = run(conn, config, tracker, yt, xmas_rules(tmp_path))
+    assert summary.quota_stopped
+    assert [c[0] for c in yt.calls] == ["playlists.insert", "playlistItems.insert"]
+    assert summary.added == 1
+    assert not tracker.is_exhausted()  # local stop does not mark the day exhausted
+
+
+def test_playlist_create_failure_skips_only_that_playlist(conn, config, tracker, tmp_path):
+    v = add_video(conn, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25",
+                  title="Christmas tree")
+    rules = load_rules(write_rules(tmp_path, XMAS_RULES + """\
+  - name: "Trees"
+    privacy: private
+    match:
+      any:
+        - {title_contains_any: ["tree"]}
+"""))
+    yt = FakeYouTube()
+    yt.playlist_script = [http_error(400, "invalidPlaylistSnippet")]
+    summary, _, _ = run(conn, config, tracker, yt, rules)
+    assert summary.failed == 1
+    assert get_playlist(conn, "Christmas Day Through the Years") is None
+    assert get_playlist(conn, "Trees")["youtube_playlist_id"] == "PL1"
+    assert yt.calls[1][1]["body"]["status"]["privacyStatus"] == "private"
+    # In one of its two playlists only: not PLAYLISTED yet.
+    assert record(conn, v).status.value == "UPLOADED"
+
+    yt2 = FakeYouTube()
+    run(conn, config, tracker, yt2, rules)
+    assert [c[0] for c in yt2.calls] == ["playlists.insert", "playlistItems.insert"]
+    assert record(conn, v).status.value == "PLAYLISTED"
+
+
+def test_playlist_not_found_skips_rest_of_that_playlist(conn, config, tracker, tmp_path):
+    _xmas_videos(conn)
+    upsert_playlist(conn, "Christmas Day Through the Years", "PLgone")
+    yt = FakeYouTube()
+    first = conn.execute(
+        "SELECT youtube_video_id FROM videos ORDER BY taken_utc LIMIT 1").fetchone()[0]
+    yt.item_script[first] = [http_error(404, "playlistNotFound")]
+    summary, _, _ = run(conn, config, tracker, yt, xmas_rules(tmp_path))
+    assert summary.failed == 1 and len(yt.item_inserts()) == 1
+
+
+def test_playlisted_video_matching_a_new_rule_is_added(conn, config, tracker, tmp_path):
+    v = add_video(conn, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25")
+    run(conn, config, tracker, FakeYouTube(), xmas_rules(tmp_path))
+    assert record(conn, v).status.value == "PLAYLISTED"
+    rules = load_rules(write_rules(tmp_path, XMAS_RULES + """\
+  - name: "2024"
     privacy: unlisted
     match:
       any:
-        - {local_month: 12, local_day: 25}
+        - {local_year: 2024}
+""", "rules2.yaml"))
+    yt = FakeYouTube()
+    summary, _, _ = run(conn, config, tracker, yt, rules)
+    assert [c[0] for c in yt.calls] == ["playlists.insert", "playlistItems.insert"]
+    assert summary.added == 1
+    assert record(conn, v).status.value == "PLAYLISTED"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _write_config(tmp_path: Path, extra_paths: str = "") -> Path:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"""\
+paths:
+  staging_dir: {tmp_path}
+  db_path: queue.db
+  credentials: credentials.json
+  token: token.json
+{extra_paths}timezone: America/New_York
+youtube:
+  privacy: unlisted
+  category_id: "22"
+  made_for_kids: false
+  title_template: "{{date}} - {{title}}"
+  default_title: "Family Video"
+quota:
+  daily_unit_limit: 10000
+  upload_cost_units: 1600
+  playlist_insert_cost: 50
+  playlist_item_insert_cost: 50
+  daily_upload_limit: null
+video_extensions: [.mp4]
 """)
-
-    plan = curate_dry_run(config, rules_file, conn=conn)
-
-    # Verify nothing was written to the database (no playlist rows inserted)
-    cursor = conn.execute("SELECT COUNT(*) FROM playlists")
-    assert cursor.fetchone()[0] == 0
-
-    cursor = conn.execute(
-        "SELECT COUNT(*) FROM playlist_membership WHERE added = 1",
-    )
-    assert cursor.fetchone()[0] == 0
+    return cfg
 
 
-# =============================================================================
-# Estimation tests
-# =============================================================================
-
-def test_estimated_cost():
-    """Test that estimated cost is computed correctly."""
-    conn = get_connection(":memory:")
-    init_db(conn)
-
-    # Insert 3 videos matching a rule
-    for i in range(1, 4):
-        cursor = conn.execute(
-            "INSERT INTO videos (source_path, sha256, size_bytes, status, created_at, updated_at, taken_utc, taken_local_date, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (f"/staging/video{i}.mp4", f"sha256:vid{i}", 1024 * 1024,
-             "UPLOADED", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-12-25T18:00:00Z",
-             "2024-12-25", f"Video {i}"),
-        )
-    conn.commit()
-
-    config = get_example_config()
-    rules_file = Path(__file__).parent.parent / "photos2yt/rules.yaml"
-    with open(rules_file, "w") as f:
-        f.write("""playlists:
-  - name: "Christmas Day Through the Years"
-    privacy: unlisted
-    match:
-      any:
-        - {local_month: 12, local_day: 25}
-""")
-
-    plan = curate_dry_run(config, rules_file, conn=conn)
-
-    # Expected cost: 1 playlist insert (50 units) + 3 videos * item_insert_cost (50 each)
-    assert plan.estimated_cost == 50 + 3 * 50  # 200
+def _seed_db(path: Path) -> int:
+    c = init_db(get_connection(path))
+    vid = add_video(c, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25", title="Xmas")
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    c.close()
+    return vid
 
 
-# =============================================================================
-# CLI tests
-# =============================================================================
-
-def test_cli_curate_dry_run():
-    """Test the CLI dry-run command using python3 explicitly."""
-    result = os.system("/usr/bin/python3 -m photos2yt.curator --help")
-    assert result == 0, "CLI should exit with 0 on success"
+def _dir_state(d: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in d.iterdir() if p.is_file()}
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+def test_cli_dry_run_missing_db_creates_nothing(tmp_path, capsys):
+    cfg = _write_config(tmp_path)
+    write_rules(tmp_path, XMAS_RULES)
+    assert cli.main(["-c", str(cfg), "curate", "--dry-run"]) == 0
+    assert not (tmp_path / "queue.db").exists()
+    assert "No database" in capsys.readouterr().out
+
+
+def test_cli_dry_run_does_not_touch_or_migrate_db(tmp_path, capsys, monkeypatch):
+    cfg = _write_config(tmp_path)
+    write_rules(tmp_path, XMAS_RULES)
+    _seed_db(tmp_path / "queue.db")
+    # Simulate an older schema: drop the newest migration marker. A migrating
+    # open would re-run it (and fail or change the file); a dry run must not.
+    c = sqlite3.connect(tmp_path / "queue.db")
+    c.execute("DELETE FROM schema_migrations WHERE version = 3")
+    c.commit()
+    c.close()
+    before = _dir_state(tmp_path)
+
+    def no_creds(*a, **k):
+        raise AssertionError("dry run must not load credentials")
+    monkeypatch.setattr(cli, "get_credentials", no_creds)
+
+    assert cli.main(["-c", str(cfg), "curate", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "Christmas Day Through the Years" in out and "position 0" in out
+    assert _dir_state(tmp_path) == before
+
+
+def test_cli_rules_option_and_config_path(tmp_path, capsys):
+    cfg = _write_config(tmp_path, "  rules: custom_rules.yaml\n")
+    _seed_db(tmp_path / "queue.db")
+    # paths.rules set but missing -> error
+    assert cli.main(["-c", str(cfg), "curate", "--dry-run"]) == 1
+    write_rules(tmp_path, XMAS_RULES, "custom_rules.yaml")
+    assert cli.main(["-c", str(cfg), "curate", "--dry-run"]) == 0
+    assert "Christmas Day Through the Years" in capsys.readouterr().out
+    other = write_rules(tmp_path, XMAS_RULES.replace("Christmas Day Through the Years", "Other"),
+                        "other.yaml")
+    assert cli.main(["-c", str(cfg), "curate", "--dry-run", "--rules", str(other)]) == 0
+    assert "Playlist 'Other'" in capsys.readouterr().out
+    assert cli.main(["-c", str(cfg), "curate", "--dry-run", "--rules",
+                     str(tmp_path / "nope.yaml")]) == 1
+
+
+def test_cli_default_rules_missing_is_not_an_error(tmp_path, capsys):
+    cfg = _write_config(tmp_path)
+    assert cli.main(["-c", str(cfg), "curate"]) == 0
+    assert "nothing to curate" in capsys.readouterr().out
+    assert not (tmp_path / "queue.db").exists()
+
+
+def test_cli_invalid_rules_exit_1(tmp_path, capsys):
+    cfg = _write_config(tmp_path)
+    write_rules(tmp_path, "playlists:\n  - {name: t, privacy: nope}\n")
+    assert cli.main(["-c", str(cfg), "curate", "--dry-run"]) == 1
+    assert "invalid 'privacy'" in capsys.readouterr().err
+
+
+def test_cli_real_run_with_fake_client(tmp_path, monkeypatch):
+    cfg = _write_config(tmp_path)
+    write_rules(tmp_path, XMAS_RULES)
+    vid = _seed_db(tmp_path / "queue.db")
+    from photos2yt.config import load_config
+    config = load_config(cfg)
+    yt = FakeYouTube()
+    factory = Factory(yt)
+    assert cli.run_curate_command(config, youtube_factory=factory, sleep=lambda s: None) == 0
+    assert [c[0] for c in yt.calls] == ["playlists.insert", "playlistItems.insert"]
+    c = get_connection(tmp_path / "queue.db")
+    assert get_video(c, vid).status.value == "PLAYLISTED"
+    c.close()
+
+    # Re-run: nothing to do, the client factory (credentials) is never called.
+    factory2 = Factory(FakeYouTube())
+    assert cli.run_curate_command(config, youtube_factory=factory2) == 0
+    assert factory2.calls == 0
+
+
+def test_cli_real_run_failure_exit_code(tmp_path):
+    cfg = _write_config(tmp_path)
+    write_rules(tmp_path, XMAS_RULES)
+    _seed_db(tmp_path / "queue.db")
+    from photos2yt.config import load_config
+    yt = FakeYouTube()
+    yt.playlist_script = [http_error(400, "invalidPlaylistSnippet")]
+    assert cli.run_curate_command(load_config(cfg), youtube_factory=Factory(yt),
+                                  sleep=lambda s: None) == 1

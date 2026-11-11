@@ -14,11 +14,66 @@
 - Task 6 part 2: post-upload verification, crash recovery, `photos2yt upload` run loop and
   read-only dry run. Awaiting human review. Not yet tested against the real API: the
   task's manual acceptance step ("upload one real short file") is still to do.
+- Task 7B: curator real run (`photos2yt curate`), plus curate --dry-run read-only fix and
+  rules path from config/CLI. Awaiting human review. Not yet run against the real API.
 
 ## Next
 - Manual: upload one real short file (`photos2yt upload --limit 1`), check the
   private-lock warning and recordingDate check against reality.
-- Task 7B / Task 8 (not started, per instructions).
+- Manual: after the first real upload, `photos2yt curate --dry-run`, then `photos2yt curate`
+  with a one-rule rules.yaml; check the playlist order in Studio.
+- Task 8 (not started).
+
+## How the curator behaves (Task 7)
+- Rules file: `curate --rules PATH`, else `paths.rules` in config.yaml (new optional key,
+  resolved relative to the config file), else `rules.yaml` next to the config file. An
+  explicitly given file that is missing is an error (exit 1); a missing default file just
+  prints "nothing to curate" (exit 0). Invalid rules: exit 1 with the reason.
+- Rules validation tightened: `match` must have non-empty `any` and/or `all` lists and no
+  other keys; within one condition every field must hold (AND); local_year now validated
+  and matched; local_month/local_day work alone; keyword lists must be non-empty strings;
+  playlist names <= 150 chars, no `<>`.
+- Candidates: rows UPLOADED or PLAYLISTED with a youtube_video_id. Matching uses
+  taken_local_date only. Order is (taken_utc, id).
+- Run, per rule in file order (only if it has videos to add):
+  1. playlist from the `playlists` table, else `playlists.insert(part=snippet,status)` with
+     the rule's privacy; the id is stored immediately.
+  2. members not yet added are inserted in date order with `playlistItems.insert(part=snippet)`
+     and an explicit position = number of already-added members (per the DB) that sort
+     before the video. Recomputed per insert from what actually succeeded, so a failed add
+     does not throw later positions off. Full backfill = 0, 1, 2, ...
+  3. before each insert a membership row (added=0, planned position) is written; on success
+     it becomes added=1 and other added members at or after that position shift by one
+     (db.record_playlist_item_added), so `position` tracks the expected playlist index.
+- Failures: a non-quota HTTP error (or retries exhausted on 5xx/429/rate limit/network) on
+  one add is counted and the run continues; the row stays added=0 and is retried on the next
+  run. A failed playlists.insert skips only that playlist. playlistNotFound (playlist
+  deleted on YouTube) skips the rest of that playlist and says how to re-create it.
+- Quota: `can_afford(cost)` before every call (local stop, day not marked exhausted);
+  quotaExceeded -> `mark_exhausted()` and stop. Costs from config (playlist_insert_cost,
+  playlist_item_insert_cost) recorded after every call that got an HTTP response, including
+  rejected ones (conservative: YouTube may charge for those).
+- After the adds (also after a quota stop) UPLOADED rows whose matching playlists all have
+  added=1 become PLAYLISTED. Rows matching no rule stay UPLOADED. A PLAYLISTED row that
+  matches a newly added rule is still added to that playlist (status stays PLAYLISTED).
+- Idempotent: a re-run with nothing to add makes zero API calls and does not even build the
+  API client, so it needs no credentials.
+- Exit code 1 if any add or playlist creation failed, else 0 (a quota stop is not a failure).
+- `--dry-run`: no credentials, no API client, DB opened with db.get_readonly_connection (a
+  missing DB is not created; an old schema is not migrated; no files change). Prints each
+  playlist (would create / exists), each add with its target position, date and title,
+  estimated units, and remaining quota today from the local counter.
+- Never uses search.list or any read call; the local DB is the source of truth.
+
+## Curator limitations / risks
+- Positions assume the YouTube playlist contains exactly the videos the DB says were added.
+  Videos added or removed by hand in Studio shift positions, so later adds can land out of
+  order, or be rejected if a position is past the end (then they fail and are retried). Re-ordering is the
+  separate `playlistItems.update` command in the spec (not built).
+- Duplicate risk: if a playlistItems.insert succeeds but the process dies before the DB
+  write, or a retried insert's first attempt actually succeeded, the next run adds the video
+  again. Same for playlists.insert (a second playlist with the same name). The window is
+  small; no reads are done to check, to save quota.
 
 ## How the uploader behaves (Task 6)
 - Run order: recover rows stuck in UPLOADING, then upload PENDING rows by (taken_utc, id).
@@ -68,7 +123,11 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
 - db.update_upload_session() (from task6-rewrite) persists the session URI; no-op unless
   the row is UPLOADING, None clears it.
 - New db helpers: update_video_verification, get_video_by_youtube_id,
-  get_readonly_connection.
+  get_readonly_connection, record_playlist_item_added (Task 7B).
+- Tests no longer write photos2yt/rules.yaml (all rules files under tmp_path; an autouse
+  fixture fails any test that touches it). .gitignore now ignores `rules.yaml` (local
+  rules next to config.yaml) instead of photos2yt/rules.yaml.
+- The old `python -m photos2yt.curator` entry point is gone; use `photos2yt curate`.
 - Upload chunk size is config: youtube.upload_chunk_size (bytes, default 8 MiB, multiple of
   256 KiB). upload_one(chunksize=...) can override it.
 - Rate limiting is retried like 5xx: HTTP 429 and 403 rateLimitExceeded /
@@ -91,4 +150,5 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
   show it: watch for the PRIVATE-UPLOAD LOCK banner).
 - Is 4 pages (200 newest uploads) the right adoption search depth? It costs up to 5 units
   per stuck row.
-- claude_code_task_breakdown.md (the main spec) is not in the repository yet.
+- Curator: should a playlist deleted on YouTube be re-created automatically? Currently it
+  is reported and left for a human (delete its row in `playlists`).
