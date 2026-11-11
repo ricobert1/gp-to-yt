@@ -38,3 +38,6 @@ manifest.csv
 
 # macOS
 .DS_Store
+
+# Local playlist rules (also written by tests/test_curator.py)
+photos2yt/rules.yaml
