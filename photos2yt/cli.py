@@ -67,6 +67,14 @@ def create_parser() -> argparse.ArgumentParser:
                                help="Playlist rules YAML (default: paths.rules from config, "
                                     "else rules.yaml next to the config file)")
 
+    # retitle command
+    retitle_parser = subparsers.add_parser(
+        "retitle",
+        help="Rebuild titles of videos not yet uploaded from the current title_template",
+    )
+    retitle_parser.add_argument("--dry-run", action="store_true",
+                                help="Show old -> new titles; database opened read-only")
+
     # reconcile command (Task 8)
     subparsers.add_parser("reconcile", help="Reconcile local database with remote YouTube videos")
 
@@ -191,6 +199,36 @@ def run_curate_command(
     return 1 if summary.failed else 0
 
 
+def run_retitle_command(config, *, dry_run: bool = False) -> int:
+    """Implements `photos2yt retitle`. Database only, never calls the API."""
+    from photos2yt.db import get_connection, get_readonly_connection, init_db
+    from photos2yt.retitle import apply_retitle, build_retitle_plan, print_plan
+
+    if dry_run:
+        try:
+            conn = get_readonly_connection(config.paths.db_path)
+        except FileNotFoundError:
+            print(f"[DRY RUN] No database at {config.paths.db_path}; nothing to retitle.")
+            return 0
+        try:
+            print_plan(build_retitle_plan(conn, config), print, dry_run=True)
+        finally:
+            conn.close()
+        return 0
+
+    if not config.paths.db_path.exists():
+        print(f"No database at {config.paths.db_path}; nothing to retitle.")
+        return 0
+    conn = init_db(get_connection(config.paths.db_path))
+    try:
+        plan = build_retitle_plan(conn, config)
+        apply_retitle(conn, plan)
+        print_plan(plan, print, dry_run=False)
+    finally:
+        conn.close()
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv)
@@ -237,6 +275,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.subcommand == "upload":
             return run_upload_command(config, limit=args.limit, dry_run=args.dry_run, wait=args.wait)
+
+        if args.subcommand == "retitle":
+            return run_retitle_command(config, dry_run=args.dry_run)
 
         if args.subcommand == "curate":
             return run_curate_command(config, dry_run=args.dry_run, rules_path=args.rules_path)

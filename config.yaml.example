@@ -9,7 +9,12 @@ youtube:
   privacy: unlisted               # requested; actual may be private (see fact 1)
   category_id: "22"
   made_for_kids: false
-  title_template: "{date} - {title}"
+  # {title}: Google Photos caption (description's first line), else a meaningful file
+  # name, else default_title. Camera names like IMG_1234 / PXL_... are never used.
+  # Also: {date} {year} {month} {day} {day_num} {month_name} {month_short}
+  #       {weekday} {weekday_short} {time}   (all local time; title max 100 chars)
+  # After changing this, run `photos2yt retitle` to update videos not yet uploaded.
+  title_template: "{title} – {weekday}, {month_name} {day_num}, {year} {time}"
   default_title: "Family Video"
   upload_chunk_size: 8388608       # bytes; resumable chunk, multiple of 262144 (256 KiB)
   channel_verified: false         # required for videos > 15 min

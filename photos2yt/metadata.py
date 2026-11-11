@@ -132,6 +132,82 @@ def compute_dates_from_datetime(dt: datetime, tz_name: str) -> tuple[str, str, d
     return taken_utc, taken_local_date, dt_local
 
 
+# File names cameras and phones generate; they say nothing about the video.
+_CAMERA_NAME_RE = re.compile(
+    r"""^(?:
+        (?:IMG|VID|MVI|MOV|DSC[FN]?|PXL|GOPR|GP|GH|GX|DJI|MAH|CIMG|SAM|WP|PANO|MOVIE|CLIP|C)
+            [\s_\-]*\d[\w\-]*
+      | VID[_\-]\d{8}[_\-]\w+                      # VID-20201224-WA0001
+      | P\d{7}                                     # P1010001 (Panasonic)
+      | \d{8}[_\-]?\d{6}\w*                         # 20201224_181500
+      | \d{4}-\d{2}-\d{2}[\s_T]\d{2}[.:\-]\d{2}[.:\-]\d{2}.*   # 2020-12-24 18.15.00
+      | (?:Screen[\s_]?Recording|RPReplay)[\s_\-].*
+      | [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
+      | [\d\s_\-.()]+                                  # only digits/punctuation
+      | trim\.[\w\-]+                               # iOS trim.<id>
+    )(?:\s*\(\d+\))?(?:-edited)?$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".m4v", ".avi", ".3gp", ".json"}
+MAX_TITLE_LEN = 100
+
+
+def is_meaningless_name(name: Optional[str]) -> bool:
+    """True for empty names and camera-generated file names (IMG_1234, PXL_..., etc.)."""
+    if name is None or not name.strip():
+        return True
+    return bool(_CAMERA_NAME_RE.match(name.strip()))
+
+
+def _strip_video_suffix(name: str) -> str:
+    p = Path(name)
+    return p.stem if p.suffix.lower() in _VIDEO_SUFFIXES else name
+
+
+def _clean_title_text(text: str) -> str:
+    text = text.replace("<", "").replace(">", "")
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def caption_from_description(description: Optional[str]) -> Optional[str]:
+    """First non-empty line of a Google Photos description, cleaned; None if none."""
+    if not description:
+        return None
+    for line in description.splitlines():
+        cleaned = _clean_title_text(line)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def choose_title_subject(
+    raw_title: Optional[str],
+    video_stem: Optional[str],
+    default_title: str,
+    caption: Optional[str] = None,
+) -> str:
+    """What the video is called, before the template adds dates.
+
+    Order: the Google Photos caption (description's first line), then the
+    sidecar title or file name if it is meaningful, else ``default_title``.
+    """
+    caption_text = caption_from_description(caption)
+    if caption_text:
+        return caption_text
+    for name in (raw_title, video_stem):
+        if name and name.strip():
+            candidate = _clean_title_text(_strip_video_suffix(name.strip()))
+            if candidate and not is_meaningless_name(candidate):
+                return candidate
+    return default_title
+
+
+def _format_time(dt_local: datetime) -> str:
+    hour = dt_local.hour % 12 or 12
+    return f"{hour}:{dt_local.minute:02d} {'AM' if dt_local.hour < 12 else 'PM'}"
+
+
 def format_title(
     template: str,
     default_title: str,
@@ -139,50 +215,49 @@ def format_title(
     taken_local_date: str,
     dt_local: datetime,
     video_stem: Optional[str] = None,
+    caption: Optional[str] = None,
 ) -> str:
-    """Format and sanitize video title according to config template and YouTube constraints.
+    """Build the YouTube title from the config template.
 
-    YouTube constraint: Title <= 100 characters.
+    ``{title}`` is the caption, a meaningful file name, or ``default_title``
+    (see choose_title_subject). Placeholders, all in local time:
+    {title} {default_title} {date} (YYYY-MM-DD) {year} {month} (01-12)
+    {day} (01-31) {day_num} (1-31) {month_name} (December) {month_short} (Dec)
+    {weekday} (Thursday) {weekday_short} (Thu) {time} (6:15 PM).
+
+    YouTube limits: at most 100 characters, no '<' or '>'. A long {title} is
+    shortened so the rest of the template (e.g. the date) still fits.
     """
-    candidate: Optional[str] = None
-    if raw_title is not None and raw_title.strip():
-        cand = raw_title.strip()
-        # If raw_title includes a file extension like .mp4, strip it for clean display
-        cand_path = Path(cand)
-        if cand_path.suffix.lower() in {".mp4", ".mov", ".mkv", ".m4v", ".avi", ".3gp", ".json"}:
-            cand = cand_path.stem
-        candidate = cand
-
-    if not candidate:
-        if video_stem and video_stem.strip():
-            candidate = video_stem.strip()
-        else:
-            candidate = default_title
-
-    # Template mapping
+    subject = choose_title_subject(raw_title, video_stem, default_title, caption)
     mapping = {
         "date": taken_local_date,
-        "title": candidate,
+        "default_title": default_title,
         "year": f"{dt_local.year}",
         "month": f"{dt_local.month:02d}",
         "day": f"{dt_local.day:02d}",
+        "day_num": f"{dt_local.day}",
+        "month_name": dt_local.strftime("%B"),
+        "month_short": dt_local.strftime("%b"),
+        "weekday": dt_local.strftime("%A"),
+        "weekday_short": dt_local.strftime("%a"),
+        "time": _format_time(dt_local),
     }
 
-    try:
-        formatted = template.format(**mapping)
-    except KeyError:
-        # Fallback if unknown placeholder in template
-        formatted = f"{taken_local_date} - {candidate}"
+    def render(title_text: str) -> str:
+        try:
+            out = template.format(title=title_text, **mapping)
+        except (KeyError, IndexError, ValueError):
+            out = f"{taken_local_date} - {title_text}"
+        return _clean_title_text(out)
 
-    # Sanitize control characters and normalize whitespace
-    sanitized = re.sub(r"[\r\n\t]+", " ", formatted)
-    sanitized = re.sub(r"\s+", " ", sanitized).strip()
-
-    if not sanitized:
-        sanitized = default_title
-
-    # Enforce YouTube <= 100 characters
-    return sanitized[:100]
+    formatted = render(subject)
+    if len(formatted) > MAX_TITLE_LEN:
+        room = MAX_TITLE_LEN - (len(render("X")) - 1)  # "X": keeps spacing exact
+        if room > 0:
+            formatted = render(subject[:room].rstrip())
+    if not formatted:
+        formatted = _clean_title_text(default_title)
+    return formatted[:MAX_TITLE_LEN]
 
 
 def format_description(
