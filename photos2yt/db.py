@@ -553,6 +553,41 @@ def transition_video_status(
         return VideoRecord.from_row(updated_row)
 
 
+def update_upload_session(
+    conn: sqlite3.Connection,
+    video_id: int,
+    session_uri: Optional[str],
+) -> None:
+    """Persist (or clear, when ``session_uri`` is None) the resumable upload
+    session URI for a video.
+
+    The resumable upload protocol returns the session URI (Location header)
+    as soon as the upload session is created.  Persisting it lets a crashed
+    or interrupted run resume the transfer instead of starting over.
+
+    Only rows currently in UPLOADING status are touched; other statuses are
+    left alone (the session URI is owned by the upload lifecycle and is
+    cleared explicitly on completion or failure via transition_video_status).
+    The URI itself is never logged.
+
+    Raises:
+        VideoNotFoundError: If no video with video_id exists.
+    """
+    with conn:
+        cursor = conn.execute("SELECT id FROM videos WHERE id = ?", (video_id,))
+        if cursor.fetchone() is None:
+            raise VideoNotFoundError(f"Video with id {video_id} not found")
+
+        conn.execute(
+            """
+            UPDATE videos
+            SET upload_session_uri = ?, updated_at = ?
+            WHERE id = ? AND status = 'UPLOADING'
+            """,
+            (session_uri, _iso_now(), video_id),
+        )
+
+
 # --- Quota Helpers ---
 
 def get_quota_log(conn: sqlite3.Connection, date_pacific: str) -> Optional[sqlite3.Row]:
