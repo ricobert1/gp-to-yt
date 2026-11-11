@@ -15,8 +15,10 @@
   read-only dry run. Awaiting human review. Not yet tested against the real API: the
   task's manual acceptance step ("upload one real short file") is still to do.
   Update 2026-11-11: done by the human, see "Real-API checks" below.
-- Task 8: `photos2yt reconcile` and `photos2yt report` (this branch). Awaiting human review;
-  not yet run against the real API (see "Next").
+- Task 8: `photos2yt reconcile` and `photos2yt report` (6b0f348, PR #6). Checked by the
+  human against the real channel (dry run, reconcile, report).
+- Task 9: Dockerfile, docker-compose.yml, nightly script, README (this branch). Awaiting
+  human review and a build on the human's machine (see "Packaging (Task 9)").
 - Task 7B: curator real run (`photos2yt curate`), plus curate --dry-run read-only fix and
   rules path from config/CLI. Awaiting human review of the diff. Checked against the real
   API (see below).
@@ -37,9 +39,50 @@
 
 ## Next
 - Manual (optional): curate a rule matching 2-3 videos and check the order in Studio.
-- Manual (Task 8): `reconcile --dry-run`, then `reconcile` against the real channel (expect
-  1 unit per 50 videos), then `report`; check manifest.csv against Studio.
-- Task 9 (not started).
+- Manual (Task 9): `docker compose build` on the machine that will run it (the ffmpeg apt
+  step could not be built in the agent sandbox), `docker compose run --rm photos2yt --help`,
+  then the 3-video sample run in README section 8, including the Docker part (step 6).
+
+## Packaging (Task 9)
+- Dockerfile: python:3.12-slim + apt ffmpeg (ffprobe) + tzdata; uv 0.11.32 copied from the
+  official `astral/uv` image (Docker Hub; same image as ghcr.io/astral-sh/uv); deps installed
+  with `uv sync --frozen --no-dev` from uv.lock into /opt/venv (dependency layer cached
+  separately from the package). Only pyproject.toml, uv.lock, README.md, photos2yt/ and
+  scripts/nightly.sh are copied (no `COPY .`), and .dockerignore also excludes config,
+  rules, credentials, tokens, databases, CSVs, .git and .venv. Runs as uid/gid 1000 by default;
+  PHOTOS2YT_CONFIG=/config/config.yaml; WORKDIR /data (ingest_report.csv lands next to the DB);
+  ENTRYPOINT photos2yt, CMD --help.
+- docker-compose.yml: one service; settings from .env (.env.example): STAGING_DIR mounted
+  read-only at /staging, CONFIG_DIR at /config (writable: the token is re-saved on refresh;
+  report writes manifest.csv/summary.txt there), DATA_DIR at /data (queue.db). Bind mounts,
+  not a named volume, so the DB is a plain folder to back up and file ownership follows
+  `user: PUID:PGID`. docker-data/ and .env are gitignored.
+- scripts/nightly.sh (installed as photos2yt-nightly): ingest -> upload --limit
+  $UPLOAD_LIMIT (default 5) -> curate -> [reconcile if RECONCILE=1] -> report. Deviation from
+  the spec's literal `ingest && upload --limit N && curate`: ingest failing stops the run, but
+  an upload exit 1 (some videos failed, the rest uploaded) still lets curate and report run;
+  the job exits 1 if any step failed, 0 otherwise. With plain `&&` one bad video would leave
+  that night's good uploads out of their playlists until the next run.
+- Scheduling: host cron / NAS task scheduler runs
+  `docker compose run --rm --entrypoint photos2yt-nightly photos2yt`; no cron daemon inside
+  the container (simpler, and the scheduler's e-mail-on-failure uses the exit code).
+- Verified in the agent sandbox (Docker 29.9): image built from the same Dockerfile except the
+  apt step (deb.debian.org is blocked there; Python's tzdata was present in the base image);
+  `--help` runs; uid 1000; /app holds no config/token/DB; zoneinfo works; `config check`,
+  `upload/curate/reconcile --dry-run` and `report` run through compose on a 3-video sample
+  (ingested natively with source paths under /staging, because the sandbox image had no
+  ffprobe); staging is read-only; a staging path with a space works; files are owned by
+  PUID; the nightly job exits 1 when ingest fails; upload without token.json gives the
+  "run photos2yt auth" error, exit 1. Not verified: the apt ffmpeg install and a containerised
+  ingest; any real API call from the container.
+- README rewritten: Google Cloud setup (API, consent screen In production, Desktop client),
+  desktop auth then copying token.json, config, commands, Docker, nightly schedule,
+  private-upload lock and audit, changing privacy in Studio, 3-video end-to-end run,
+  manual offload checklist.
+- Gotchas documented: `paths.rules` set (as in config.yaml.example) but the file missing
+  makes curate, and so the nightly job, exit 1; the DB stores absolute source paths, so a
+  queue.db built on the desktop cannot upload from the container; `auth` cannot run inside
+  the container (no browser).
 
 ## How reconcile behaves (Task 8)
 - Checks rows in status UPLOADED **and PLAYLISTED** that have a youtube_video_id. PLAYLISTED
@@ -282,6 +325,10 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
   over the next few uploads.
 - Is 4 pages (200 newest uploads) the right adoption search depth? It costs up to 5 units
   per stuck row.
+- Docker: should a missing `paths.rules` file from config be treated like the default (print
+  "nothing to curate", exit 0) instead of an error, so a nightly run without playlists is
+  green? Currently documented instead of changed.
+- Docker: publish a prebuilt image (e.g. GHCR) or keep building locally? Currently local.
 - Reconcile: should a missing video (deleted on YouTube) make the exit code non-zero, so a
   nightly cron run alerts? Currently exit 0 and it is only reported.
 - Reconcile: should a missing video be re-queued for upload (would need a new

@@ -43,3 +43,7 @@ summary.txt
 
 # Local playlist rules (paths.rules; default rules.yaml next to config.yaml)
 rules.yaml
+
+# Docker local data and settings
+docker-data/
+.env
