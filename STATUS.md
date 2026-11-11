@@ -25,14 +25,12 @@
 - Quota recording in auth check is best-effort (errors swallowed).
 - made_for_kids must be false in config.yaml.
 
-- db.py gained update_upload_session() (sets upload_session_uri on an UPLOADING row without
-  a status change); covered in tests/test_db.py.
+- db.update_upload_session() (from task6-rewrite) is used to persist the session URI; it is a
+  no-op unless the row is UPLOADING, and None clears it. Covered in tests/test_db.py.
 - Upload chunk size is an upload_one(chunksize=...) argument (default 8 MiB), not yet a
   config.yaml key; part 2 should wire it from config.
 - Transient errors that exhaust retries mark the row FAILED (session URI kept) and raise
   UploadRetriesExhaustedError so the run loop stops.
-- tests/test_curator.py: 6 tests fail before and after this change because they expect
-  photos2yt/config.yaml.example, which is not committed (exists only on the dev machine).
 
 ## Open questions
 - Should 403 rateLimitExceeded / userRateLimitExceeded and 429 be retried rather than FAILED?
