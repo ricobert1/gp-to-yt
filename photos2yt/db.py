@@ -553,6 +553,41 @@ def transition_video_status(
         return VideoRecord.from_row(updated_row)
 
 
+def update_upload_session(
+    conn: sqlite3.Connection,
+    video_id: int,
+    upload_session_uri: str,
+) -> VideoRecord:
+    """Persist the resumable upload session URI for a video that is UPLOADING.
+
+    This does not change status (UPLOADING -> UPLOADING is not a transition);
+    it only records the session URI mid-upload so a crash can resume later.
+
+    Raises:
+        VideoNotFoundError: If no video with video_id exists.
+        DatabaseError: If the video is not currently UPLOADING.
+    """
+    with conn:
+        row = conn.execute(
+            "SELECT status FROM videos WHERE id = ?", (video_id,)
+        ).fetchone()
+        if row is None:
+            raise VideoNotFoundError(f"Video with id {video_id} not found")
+        if row["status"] != VideoStatus.UPLOADING.value:
+            raise DatabaseError(
+                f"Cannot set upload session for video {video_id}: "
+                f"status is {row['status']}, expected UPLOADING"
+            )
+        conn.execute(
+            "UPDATE videos SET upload_session_uri = ?, updated_at = ? WHERE id = ?",
+            (upload_session_uri, _iso_now(), video_id),
+        )
+        updated_row = conn.execute(
+            "SELECT * FROM videos WHERE id = ?", (video_id,)
+        ).fetchone()
+        return VideoRecord.from_row(updated_row)
+
+
 # --- Quota Helpers ---
 
 def get_quota_log(conn: sqlite3.Connection, date_pacific: str) -> Optional[sqlite3.Row]:
