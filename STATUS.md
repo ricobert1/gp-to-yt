@@ -27,14 +27,15 @@
 
 - db.update_upload_session() (from task6-rewrite) is used to persist the session URI; it is a
   no-op unless the row is UPLOADING, and None clears it. Covered in tests/test_db.py.
-- Upload chunk size is an upload_one(chunksize=...) argument (default 8 MiB), not yet a
-  config.yaml key; part 2 should wire it from config.
+- Upload chunk size is config: youtube.upload_chunk_size (bytes, default 8388608 = 8 MiB,
+  must be a multiple of 256 KiB). upload_one(chunksize=...) can still override it.
+- Rate limiting is retried like 5xx: HTTP 429 and 403 rateLimitExceeded /
+  userRateLimitExceeded. Retry-After is honoured (capped at 300 s), otherwise exponential
+  backoff. 403 quotaExceeded is never retried.
 - Transient errors that exhaust retries mark the row FAILED (session URI kept) and raise
   UploadRetriesExhaustedError so the run loop stops.
 
 ## Open questions
-- Should 403 rateLimitExceeded / userRateLimitExceeded and 429 be retried rather than FAILED?
-  (Currently treated as "other 4xx" per the task spec.)
 - recordingDetails.location may be deprecated by the API; kept because the spec requires it.
 - Confirm current videos.insert quota cost against Google's table before first real upload.
 - Whether the API project is subject to the private-upload lock (find out in Task 6 first upload).

@@ -17,6 +17,10 @@ class ConfigError(Exception):
 
 VALID_PRIVACY_VALUES = {"private", "unlisted", "public"}
 
+# Resumable upload chunks must be a multiple of 256 KiB (YouTube/Google API rule).
+UPLOAD_CHUNK_ALIGNMENT = 256 * 1024
+DEFAULT_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MiB
+
 
 @dataclass(frozen=True)
 class PathsConfig:
@@ -33,6 +37,7 @@ class YouTubeConfig:
     made_for_kids: bool
     title_template: str
     default_title: str
+    upload_chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,20 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
         if not isinstance(default_title, str) or not default_title.strip():
             errors.append("youtube.default_title is required and must be a non-empty string")
 
+        chunk_size = yt_data.get("upload_chunk_size", DEFAULT_UPLOAD_CHUNK_SIZE)
+        chunk_ok = (
+            isinstance(chunk_size, int)
+            and not isinstance(chunk_size, bool)
+            and chunk_size > 0
+            and chunk_size % UPLOAD_CHUNK_ALIGNMENT == 0
+        )
+        if not chunk_ok:
+            errors.append(
+                "youtube.upload_chunk_size must be a positive integer number of bytes and a "
+                f"multiple of {UPLOAD_CHUNK_ALIGNMENT} (256 KiB), e.g. 8388608 for 8 MiB; "
+                f"got {repr(chunk_size)}"
+            )
+
         if yt_data and all(k in yt_data for k in ("privacy", "category_id", "made_for_kids", "title_template", "default_title")):
             if privacy in VALID_PRIVACY_VALUES and isinstance(made_for_kids, bool):
                 yt_obj = YouTubeConfig(
@@ -142,6 +161,7 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
                     made_for_kids=made_for_kids,
                     title_template=str(title_tpl),
                     default_title=str(default_title),
+                    upload_chunk_size=chunk_size if chunk_ok else DEFAULT_UPLOAD_CHUNK_SIZE,
                 )
 
     # 4. Validate 'quota'

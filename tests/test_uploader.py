@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import httplib2
 import pytest
-from googleapiclient.errors import HttpError
+from googleapiclient.errors import HttpError, ResumableUploadError
 from googleapiclient.http import MediaFileUpload
 
 from photos2yt.config import Config, PathsConfig, QuotaConfig, YouTubeConfig
@@ -32,7 +32,6 @@ from photos2yt.db import (
 )
 from photos2yt.quota import QuotaTracker
 from photos2yt.uploader import (
-    DEFAULT_CHUNKSIZE,
     QuotaExhaustedError,
     UploadLimitExceededError,
     UploadRetriesExhaustedError,
@@ -50,11 +49,21 @@ UPLOAD_COST = 1600
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_http_error(status: int, reason: str | None, message: str = "error") -> HttpError:
+def make_http_error(
+    status: int,
+    reason: str | None,
+    message: str = "error",
+    *,
+    retry_after: str | None = None,
+    cls: type[HttpError] = HttpError,
+) -> HttpError:
     errors = [{"reason": reason, "domain": "youtube", "message": message}] if reason else []
     body = {"error": {"code": status, "message": message, "errors": errors}}
-    return HttpError(
-        httplib2.Response({"status": str(status)}),
+    headers = {"status": str(status)}
+    if retry_after is not None:
+        headers["retry-after"] = retry_after
+    return cls(
+        httplib2.Response(headers),
         json.dumps(body).encode("utf-8"),
         uri=SESSION_URI,
     )
@@ -459,6 +468,83 @@ def test_retry_is_per_chunk_not_whole_file(conn, config, tracker, make_video):
     youtube.videos.return_value.insert.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "status,reason",
+    [(403, "rateLimitExceeded"), (403, "userRateLimitExceeded"), (429, "rateLimitExceeded"), (429, None)],
+)
+def test_rate_limit_errors_are_retried(conn, config, tracker, make_video, status, reason):
+    video = make_video()
+    request = FakeRequest([make_http_error(status, reason, "slow down"), SUCCESS])
+    result = upload_one(
+        conn, config, tracker, make_youtube(request), video, sleep=no_sleep
+    )
+    assert result.status == VideoStatus.UPLOADED
+    assert request.calls == 2
+    assert tracker.is_exhausted() is False
+    assert quota_units(conn) == (UPLOAD_COST, 1)
+
+
+def test_rate_limit_retries_are_bounded_then_fail(conn, config, tracker, make_video):
+    video = make_video()
+    request = FakeRequest([make_http_error(403, "rateLimitExceeded")] * 5)
+    with pytest.raises(UploadRetriesExhaustedError):
+        upload_one(
+            conn, config, tracker, make_youtube(request), video,
+            max_attempts=3, sleep=no_sleep,
+        )
+    row = get_video(conn, video.id)
+    assert request.calls == 3
+    assert row.status == VideoStatus.FAILED
+    assert "rateLimitExceeded" in row.last_error
+    assert tracker.is_exhausted() is False
+    assert quota_units(conn) == (0, 0)
+
+
+def test_retry_after_header_is_honoured(conn, config, tracker, make_video):
+    video = make_video()
+    sleeps: list[float] = []
+    request = FakeRequest(
+        [
+            make_http_error(429, "rateLimitExceeded", retry_after="17"),
+            make_http_error(503, "backendError", retry_after="42"),
+            make_http_error(503, "backendError"),  # no header -> exponential
+            SUCCESS,
+        ]
+    )
+    upload_one(
+        conn, config, tracker, make_youtube(request), video, sleep=sleeps.append
+    )
+    assert sleeps[0] == 17.0
+    assert sleeps[1] == 42.0
+    assert 1.0 <= sleeps[2] <= 60.0
+
+
+def test_retry_after_is_capped(conn, config, tracker, make_video):
+    from photos2yt.uploader import MAX_RETRY_AFTER_SECONDS
+
+    video = make_video()
+    sleeps: list[float] = []
+    request = FakeRequest([make_http_error(429, None, retry_after="86400"), SUCCESS])
+    upload_one(
+        conn, config, tracker, make_youtube(request), video, sleep=sleeps.append
+    )
+    assert sleeps == [MAX_RETRY_AFTER_SECONDS]
+
+
+def test_quota_exceeded_on_session_initiation(conn, config, tracker, make_video):
+    """The client raises ResumableUploadError (an HttpError) if the initiating POST fails."""
+    video = make_video()
+    err = make_http_error(403, "quotaExceeded", "quota", cls=ResumableUploadError)
+    request = FakeRequest([err], uri=None)
+    with pytest.raises(QuotaExhaustedError):
+        upload_one(conn, config, tracker, make_youtube(request), video, sleep=no_sleep)
+    row = get_video(conn, video.id)
+    assert row.status == VideoStatus.PENDING
+    assert row.upload_session_uri is None
+    assert tracker.is_exhausted() is True
+    assert request.calls == 1
+
+
 def test_missing_source_file_marks_failed(conn, config, tracker, make_video, tmp_path):
     video = make_video(source_path=str(tmp_path / "gone.mp4"))
     request = FakeRequest([SUCCESS])
@@ -508,10 +594,20 @@ def test_insert_called_with_parts_body_and_resumable_media(
     media = kwargs["media_body"]
     assert isinstance(media, MediaFileUpload)
     assert media.resumable() is True
-    assert media.chunksize() == DEFAULT_CHUNKSIZE == 8 * 1024 * 1024
+    assert media.chunksize() == config.youtube.upload_chunk_size == 8 * 1024 * 1024
 
 
-def test_chunksize_is_configurable(conn, config, tracker, make_video):
+def test_chunksize_comes_from_config(conn, config, tracker, make_video):
+    from dataclasses import replace
+
+    cfg = replace(config, youtube=replace(config.youtube, upload_chunk_size=512 * 1024))
+    video = make_video()
+    youtube = make_youtube(FakeRequest([SUCCESS]))
+    upload_one(conn, cfg, tracker, youtube, video, sleep=no_sleep)
+    assert insert_kwargs(youtube)["media_body"].chunksize() == 512 * 1024
+
+
+def test_chunksize_argument_overrides_config(conn, config, tracker, make_video):
     video = make_video()
     youtube = make_youtube(FakeRequest([SUCCESS]))
     upload_one(

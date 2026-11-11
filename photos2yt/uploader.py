@@ -4,7 +4,9 @@ Scope of this module (part 1):
   * build the videos.insert request body from a DB row and config,
   * run a real resumable upload (MediaFileUpload + next_chunk loop),
   * persist the resumable session URI as soon as it exists,
-  * retry individual chunks on transient errors with tenacity,
+  * retry individual chunks on transient errors with tenacity (5xx, network
+    errors, and rate limiting: 429 / 403 rateLimitExceeded, honouring
+    Retry-After when the server sends it),
   * classify API errors by the ``reason`` in the HttpError JSON body,
   * drive the row through PENDING -> UPLOADING -> UPLOADED / PENDING / FAILED,
   * record quota only after a successful upload.
@@ -28,12 +30,14 @@ import ssl
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Optional
 
 import httplib2
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from tenacity import (
+    RetryCallState,
     RetryError,
     Retrying,
     retry_if_exception,
@@ -52,11 +56,17 @@ from photos2yt.quota import QuotaTracker
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CHUNKSIZE = 8 * 1024 * 1024  # 8 MiB; must be a multiple of 256 KiB
+# The chunk size default lives in config (youtube.upload_chunk_size).
 DEFAULT_MAX_ATTEMPTS = 5  # per chunk, including the first try
 UPLOAD_PARTS = "snippet,status,recordingDetails"
 
-RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504})
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+# 403s that mean "slow down", not "you may not". quotaExceeded is deliberately
+# NOT here: it is the authoritative daily stop signal.
+RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
+# Upper bound on a server-requested Retry-After wait, so one bad header cannot
+# stall a run indefinitely. Retries remain bounded by max_attempts.
+MAX_RETRY_AFTER_SECONDS = 300.0
 
 # Network-level failures worth retrying. Deliberately NOT bare OSError, so a
 # missing/unreadable source file (FileNotFoundError, PermissionError) is not
@@ -211,8 +221,44 @@ def _safe_error_text(info: ApiErrorInfo) -> str:
 
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, HttpError):
-        return int(getattr(exc.resp, "status", 0) or 0) in RETRYABLE_STATUS_CODES
+        info = parse_http_error(exc)
+        if info.status in RETRYABLE_STATUS_CODES:
+            return True
+        return info.status == 403 and info.reason in RATE_LIMIT_REASONS
     return isinstance(exc, NETWORK_ERRORS)
+
+
+def _retry_after_seconds(exc: Optional[BaseException]) -> Optional[float]:
+    """Seconds requested by a Retry-After header (delta-seconds or HTTP-date), if any."""
+    if not isinstance(exc, HttpError) or exc.resp is None:
+        return None
+    raw = exc.resp.get("retry-after")
+    if raw is None:
+        return None
+    raw = str(raw).strip()
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
+
+
+_exponential_wait = wait_exponential(multiplier=1, min=1, max=60)
+
+
+def _retry_wait(retry_state: RetryCallState) -> float:
+    """Use the server's Retry-After when given, otherwise exponential backoff."""
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    requested = _retry_after_seconds(exc)
+    if requested is not None:
+        return requested
+    return _exponential_wait(retry_state)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +272,7 @@ def upload_one(
     youtube,
     video: VideoRecord,
     *,
-    chunksize: int = DEFAULT_CHUNKSIZE,
+    chunksize: Optional[int] = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     sleep: Callable[[float], None] = time.sleep,
 ) -> VideoRecord:
@@ -240,7 +286,8 @@ def upload_one(
         raised (API quota is NOT marked exhausted).
       * any other 4xx (or no video id in the response): row FAILED with
         last_error; the FAILED record is returned (the run may continue).
-      * transient errors (5xx / network) beyond ``max_attempts`` for one chunk:
+      * transient errors (5xx / 429 / 403 rate limit / network) beyond
+        ``max_attempts`` for one chunk:
         row FAILED with last_error, UploadRetriesExhaustedError raised.
 
     Args:
@@ -249,12 +296,15 @@ def upload_one(
         tracker: QuotaTracker for this connection.
         youtube: Authorized YouTube API client (googleapiclient resource).
         video: The row to upload; must currently be PENDING in the DB.
-        chunksize: Resumable chunk size in bytes (default 8 MiB).
+        chunksize: Resumable chunk size in bytes; defaults to
+            config.youtube.upload_chunk_size.
         max_attempts: Attempts per chunk, including the first (>= 1).
         sleep: Sleep function used between retries (injectable for tests).
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
+    if chunksize is None:
+        chunksize = config.youtube.upload_chunk_size
 
     # PENDING -> UPLOADING before any request is made.
     video = transition_video_status(
@@ -296,7 +346,7 @@ def upload_one(
 
     retrying = Retrying(
         retry=retry_if_exception(_is_retryable),
-        wait=wait_exponential(multiplier=1, min=1, max=60),
+        wait=_retry_wait,
         stop=stop_after_attempt(max_attempts),
         sleep=sleep,
         reraise=False,
