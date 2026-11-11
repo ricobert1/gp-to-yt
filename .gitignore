@@ -47,3 +47,4 @@ rules.yaml
 # Docker local data and settings
 docker-data/
 .env
+logs/

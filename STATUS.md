@@ -39,9 +39,11 @@
 
 ## Next
 - Manual (optional): curate a rule matching 2-3 videos and check the order in Studio.
-- Manual (Task 9): `docker compose build` on the machine that will run it (the ffmpeg apt
-  step could not be built in the agent sandbox), `docker compose run --rm photos2yt --help`,
-  then the 3-video sample run in README section 8, including the Docker part (step 6).
+- Manual (Task 9, Docker, optional): `docker compose build` and
+  `docker compose run --rm photos2yt --help` if Docker is used later. Still never built
+  with the apt ffmpeg step anywhere.
+- Manual (Mac schedule): `uv run python scripts/launchd.py install`, then `run-now` and
+  `status`; check logs/nightly.log and that a failed run shows a notification.
 
 ## Packaging (Task 9)
 - Dockerfile: python:3.12-slim + apt ffmpeg (ffprobe) + tzdata; uv 0.11.32 copied from the
@@ -63,6 +65,23 @@
   an upload exit 1 (some videos failed, the rest uploaded) still lets curate and report run;
   the job exits 1 if any step failed, 0 otherwise. With plain `&&` one bad video would leave
   that night's good uploads out of their playlists until the next run.
+- Real run without Docker (2026-11-11, by the human, on the Mac with uv; Docker is not
+  installed there and Homebrew is not wanted): scripts/nightly.sh with
+  PATH=.venv/bin and PHOTOS2YT_CONFIG=config.yaml, first with UPLOAD_LIMIT=0 and then a
+  real run; every step ran and the job exited 0. The Docker image remains unbuilt.
+- macOS schedule: scripts/launchd.py (run with `uv run python`) writes
+  ~/Library/LaunchAgents/com.photos2yt.nightly.plist via plistlib and loads it with
+  `launchctl bootstrap gui/<uid>`; also `run-now` (kickstart), `status` (`launchctl print`:
+  last exit code, plus the last log lines) and `uninstall` (bootout + delete). The job runs
+  `/bin/sh scripts/nightly.sh || osascript display notification`, so a failed run shows a
+  macOS notification (launchd itself reports nothing). Environment: PATH = repo .venv/bin +
+  the folder of the ffprobe found at install time + system dirs; PHOTOS2YT_CONFIG =
+  repo/config.yaml; UPLOAD_LIMIT; WorkingDirectory = repo (ingest_report.csv there); output
+  appended to logs/nightly.log (gitignored). Default time: 00:30 America/Los_Angeles
+  converted to the Mac's zone at install time (StartCalendarInterval is local time; correct
+  across DST in US zones). Tested with a fake launchctl and a temp home (not run on a real
+  Mac yet). Known macOS limit: TCC blocks launchd jobs from Desktop/Documents/Downloads and
+  removable volumes; README says to move the folders or grant Full Disk Access.
 - Scheduling: host cron / NAS task scheduler runs
   `docker compose run --rm --entrypoint photos2yt-nightly photos2yt`; no cron daemon inside
   the container (simpler, and the scheduler's e-mail-on-failure uses the exit code).
