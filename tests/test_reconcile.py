@@ -377,3 +377,11 @@ def test_cli_run_and_exit_codes(config, capsys):
 def test_cli_parser_has_dry_run():
     args = cli.create_parser().parse_args(["reconcile", "--dry-run"])
     assert args.subcommand == "reconcile" and args.dry_run
+
+
+def test_reconcile_records_verified_at_only_for_present_videos(conn, config, tracker):
+    a = add_video(conn, yt_id="A")
+    gone = add_video(conn, yt_id="GONE", name="gone")
+    run(conn, config, tracker, FakeYouTube({"A": item("A")}))
+    assert get_video(conn, a).verified_at == FROZEN_NOW.isoformat()
+    assert get_video(conn, gone).verified_at is None

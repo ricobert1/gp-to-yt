@@ -105,6 +105,29 @@
   queue.db built on the desktop cannot upload from the container; `auth` cannot run inside
   the container (no browser).
 
+## How cleanup behaves (local originals, 2026-11-11)
+- Requested by the human, who also approved the AGENT_RULES ground-rule exception (section
+  0) that allows it. `photos2yt cleanup [--dry-run] [--dest DIR] [--delete --yes]
+  [--max-age-days N]`.
+- Moves by default: source file -> paths.uploaded_dir (new optional config key, relative to the
+  config file; default "<staging_dir>-uploaded" beside staging_dir) at the same relative path.
+  A destination inside staging_dir (or containing it) is refused, since ingest would find the
+  files again. `--delete` deletes permanently and needs `--yes` (exit 2 without it).
+- Eligible rows: UPLOADED/PLAYLISTED, youtube_video_id set, verified_at within max-age-days
+  (default 7), and last_error not a "[reconcile" note. Their duplicates (duplicate_of an
+  eligible row) go too. Files must exist, resolve inside staging_dir and have size_bytes
+  from ingest; otherwise they are listed as "left alone". Missing files count as "already
+  gone" (normal after an earlier cleanup). Sidecars move only when every row using the
+  sidecar is eligible. A destination that exists is never overwritten.
+- New migration 4: videos.verified_at (UTC ISO). reconcile sets it (db.mark_verified) for every
+  video videos.list returned; missing videos keep their old value. The post-upload verification
+  does not set it (a just-uploaded video can still be rejected while processing).
+- The database is opened read-only (never migrated by cleanup); a database without verified_at
+  gets "run reconcile once". Each move/delete is appended to cleanup_log.csv next to the DB
+  (time, action, row, video id, source, destination). Exit 1 if any file failed.
+- Not part of the nightly job. In Docker the staging mount is read-only, so cleanup is for
+  native runs.
+
 ## How reconcile behaves (Task 8)
 - Checks rows in status UPLOADED **and PLAYLISTED** that have a youtube_video_id. PLAYLISTED
   rows are uploaded videos too (PLAYLISTED only means the playlist adds are done), and they are
@@ -299,7 +322,8 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
 - made_for_kids must be false in config.yaml.
 - db.update_upload_session() (from task6-rewrite) persists the session URI; no-op unless
   the row is UPLOADING, None clears it.
-- New db helpers: update_video_verification, get_video_by_youtube_id,
+- New db helpers: mark_verified and migration 4 (videos.verified_at) for cleanup;
+  update_video_verification, get_video_by_youtube_id,
   get_readonly_connection, record_playlist_item_added (Task 7B), set_reconcile_note and
   RECONCILE_NOTE_PREFIX (Task 8). No schema change in Task 8.
 - curate --dry-run with no rules configured now says "no playlist rules are configured"
@@ -352,10 +376,8 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
   over the next few uploads.
 - Is 4 pages (200 newest uploads) the right adoption search depth? It costs up to 5 units
   per stuck row.
-- Deleting originals automatically: not possible for Google Photos (the Photos Library API
-  has no delete call, and since March 2025 it can only see media the app itself created).
-  Deleting the local Takeout copies would need the ground rule "never delete or modify source
-  files" (AGENT_RULES section 0) changed by the human; not done.
+- Deleting from Google Photos automatically: not possible (the Photos Library API has no
+  delete call, and since March 2025 it can only see media the app itself created). Manual.
 - Docker: should a missing `paths.rules` file from config be treated like the default (print
   "nothing to curate", exit 0) instead of an error, so a nightly run without playlists is
   green? Currently documented instead of changed.

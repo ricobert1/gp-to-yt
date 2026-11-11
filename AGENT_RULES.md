@@ -7,7 +7,7 @@
 - Dependencies: `google-api-python-client`, `google-auth-oauthlib`, `google-auth-httplib2`, `tenacity`, `pyyaml`, `pytest`. External binary: `ffprobe` (from ffmpeg). Standard library `sqlite3`.
 - All tunables live in `config.yaml` (see Task 1). No hardcoded quota numbers, time zones, paths, or title templates.
 - Every command that mutates anything (uploads, playlist writes) supports `--dry-run`.
-- Never delete or modify source files. Read-only on the staging directory.
+- Never delete or modify source files. Read-only on the staging directory. **One exception,** approved by the human on 2026-11-11: `photos2yt cleanup` may move source files (and sidecars) out of the staging directory, or delete them only with `--delete --yes`, and only for videos that `reconcile` confirmed on YouTube recently (`verified_at`), with no open reconcile problem and an unchanged file size. No other code may move, delete or modify source files.
 - Secrets (`credentials.json`, `token.json`) stay out of git; `token.json` is chmod 600.
 - Use `America/Los_Angeles` for quota reset logic (handles PST/PDT).
 

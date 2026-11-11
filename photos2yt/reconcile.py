@@ -37,6 +37,7 @@ from photos2yt.config import Config
 from photos2yt.db import (
     RECONCILE_NOTE_PREFIX,
     VideoRecord,
+    mark_verified,
     set_reconcile_note,
     update_video_verification,
 )
@@ -185,7 +186,7 @@ class _Reconciler:
     def __init__(self, conn, config: Config, tracker: QuotaTracker,
                  youtube_factory: Callable[[], Any], out: Printer,
                  sleep: Optional[Callable[[float], None]], max_attempts: int,
-                 today: str) -> None:
+                 today: str, now_iso: str) -> None:
         self.conn = conn
         self.config = config
         self.tracker = tracker
@@ -195,6 +196,7 @@ class _Reconciler:
         self.sleep = sleep
         self.max_attempts = max_attempts
         self.today = today
+        self.now_iso = now_iso
         self.summary = ReconcileSummary()
 
     @property
@@ -287,6 +289,7 @@ class _Reconciler:
                 continue
 
             self.summary.present += 1
+            mark_verified(self.conn, video.id, self.now_iso)
             status = item.get("status") or {}
             actual = status.get("privacyStatus")
             if actual and actual != video.actual_privacy:
@@ -335,7 +338,8 @@ def run_reconcile(
     today = now.astimezone(timezone.utc).date().isoformat()
 
     videos = reconcile_candidates(conn)
-    runner = _Reconciler(conn, config, tracker, youtube_factory, out, sleep, max_attempts, today)
+    runner = _Reconciler(conn, config, tracker, youtube_factory, out, sleep, max_attempts, today,
+                         now.astimezone(timezone.utc).isoformat())
     s = runner.summary
     if not videos:
         out("Nothing to reconcile: no UPLOADED or PLAYLISTED rows with a video id.")

@@ -48,3 +48,4 @@ rules.yaml
 docker-data/
 .env
 logs/
+cleanup_log.csv

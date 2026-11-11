@@ -86,6 +86,24 @@ def create_parser() -> argparse.ArgumentParser:
                                   help="List what would be checked and the estimated units; "
                                        "no API calls, no credentials, database opened read-only")
 
+    # cleanup command: local originals confirmed on YouTube
+    cleanup_parser = subparsers.add_parser(
+        "cleanup",
+        help="Move (or delete) local originals that reconcile confirmed are on YouTube",
+    )
+    cleanup_parser.add_argument("--dry-run", action="store_true",
+                                help="List what would be moved/deleted; changes nothing")
+    cleanup_parser.add_argument("--dest", default=None,
+                                help="Destination folder (default: paths.uploaded_dir, "
+                                     "else <staging_dir>-uploaded)")
+    cleanup_parser.add_argument("--delete", action="store_true",
+                                help="Delete permanently instead of moving (needs --yes)")
+    cleanup_parser.add_argument("--yes", action="store_true",
+                                help="Confirm --delete")
+    cleanup_parser.add_argument("--max-age-days", type=int, default=7,
+                                help="Only files whose video reconcile confirmed within this many "
+                                     "days (default 7)")
+
     # report command (Task 8)
     report_parser = subparsers.add_parser(
         "report", help="Write manifest.csv and summary.txt from the database (no API calls)"
@@ -327,6 +345,50 @@ def run_reconcile_command(
     return 1 if summary.failed_batches else 0
 
 
+def run_cleanup_command(
+    config,
+    *,
+    dry_run: bool = False,
+    dest: Optional[str] = None,
+    delete: bool = False,
+    yes: bool = False,
+    max_age_days: int = 7,
+    now=None,
+) -> int:
+    """Implements `photos2yt cleanup`. The database is only read (read-only
+    connection, never created or migrated). Exit 1 if any file failed, 2 for
+    bad options."""
+    from photos2yt.cleanup import CleanupError, LOG_NAME, apply_plan, build_plan, format_plan
+    from photos2yt.db import get_readonly_connection
+
+    if delete and not yes and not dry_run:
+        sys.stderr.write("--delete removes files permanently; add --yes to confirm "
+                         "(or use --dry-run first).\n")
+        return 2
+    if max_age_days < 0:
+        sys.stderr.write("--max-age-days must be zero or positive\n")
+        return 2
+    try:
+        conn = get_readonly_connection(config.paths.db_path)
+    except FileNotFoundError:
+        print(f"No database at {config.paths.db_path}; nothing to clean up.")
+        return 0
+    try:
+        plan = build_plan(conn, config, max_age_days=max_age_days, delete=delete,
+                          dest=Path(dest) if dest else None, now=now)
+    except CleanupError as err:
+        sys.stderr.write(f"{err}\n")
+        return 1
+    finally:
+        conn.close()
+    print(format_plan(plan, dry_run=dry_run))
+    if dry_run or not plan.actions:
+        return 0
+    log_path = Path(config.paths.db_path).resolve().parent / LOG_NAME
+    summary = apply_plan(plan, log_path, now=now)
+    return 1 if summary.failed else 0
+
+
 def default_report_dir(config) -> Path:
     """Next to the config file, else the current directory."""
     if getattr(config, "config_path", None):
@@ -414,6 +476,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.subcommand == "reconcile":
             return run_reconcile_command(config, dry_run=args.dry_run)
+
+        if args.subcommand == "cleanup":
+            return run_cleanup_command(
+                config, dry_run=args.dry_run, dest=args.dest, delete=args.delete,
+                yes=args.yes, max_age_days=args.max_age_days,
+            )
 
         if args.subcommand == "report":
             return run_report_command(config, out_dir=args.out_dir)

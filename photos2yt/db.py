@@ -128,6 +128,7 @@ class VideoRecord:
     youtube_video_id: Optional[str] = None
     actual_privacy: Optional[str] = None
     duplicate_of: Optional[int] = None
+    verified_at: Optional[str] = None  # last time reconcile saw it on YouTube (UTC ISO)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row | dict[str, Any]) -> VideoRecord:
@@ -155,10 +156,11 @@ class VideoRecord:
             youtube_video_id=data.get("youtube_video_id"),
             actual_privacy=data.get("actual_privacy"),
             duplicate_of=data.get("duplicate_of"),
+            verified_at=data.get("verified_at"),
         )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 MIGRATIONS: dict[int, list[str]] = {
     1: [
@@ -292,6 +294,11 @@ MIGRATIONS: dict[int, list[str]] = {
         """
         ALTER TABLE quota_log ADD COLUMN exhausted_at TEXT;
         """,
+    ],
+    4: [
+        # When `photos2yt reconcile` last saw the video on YouTube (UTC ISO).
+        # `photos2yt cleanup` only touches originals verified recently.
+        "ALTER TABLE videos ADD COLUMN verified_at TEXT;",
     ],
 }
 
@@ -895,3 +902,16 @@ def set_reconcile_note(conn: sqlite3.Connection, video_id: int, note: Optional[s
                 (note, _iso_now(), video_id, note),
             )
     return cur.rowcount == 1
+
+
+def mark_verified(conn: sqlite3.Connection, video_id: int, when: str) -> None:
+    """Record that reconcile saw this uploaded video on YouTube at ``when``.
+
+    Never changes status; only UPLOADED/PLAYLISTED rows are touched.
+    """
+    with conn:
+        conn.execute(
+            "UPDATE videos SET verified_at = ? "
+            "WHERE id = ? AND status IN ('UPLOADED', 'PLAYLISTED')",
+            (when, video_id),
+        )

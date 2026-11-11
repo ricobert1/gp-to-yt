@@ -228,7 +228,7 @@ def test_schema_migration_idempotent_memory():
     cursor = conn.cursor()
     cursor.execute("SELECT version FROM schema_migrations")
     versions = [row[0] for row in cursor.fetchall()]
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
 
 
 def test_schema_migration_idempotent_file(tmp_path: Path):
@@ -389,7 +389,7 @@ def test_migration_v1_to_v2_preserves_existing_data(tmp_path: Path):
 
     # Check migration version
     versions = [r[0] for r in conn2.execute("SELECT version FROM schema_migrations ORDER BY version ASC").fetchall()]
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
 
     # Verify rows
     v1 = get_video(conn2, 1)
