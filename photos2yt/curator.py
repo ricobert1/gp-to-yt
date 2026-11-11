@@ -82,6 +82,22 @@ _INT_RANGES = {"local_month": (1, 12), "local_day": (1, 31), "local_year": (1800
 MAX_PLAYLIST_TITLE = 150  # YouTube playlist title limit
 
 
+# YouTube answers playlist writes made in quick succession (notably right
+# after playlists.insert) with HTTP 409, reason SERVICE_UNAVAILABLE, "The
+# operation was aborted." The write was not applied, so retrying is safe.
+_ABORTED_409_REASONS = frozenset({"SERVICE_UNAVAILABLE"})
+
+
+def _is_retryable_playlist_error(exc: BaseException) -> bool:
+    """Uploader's transient errors, plus YouTube's aborted-409 on playlist writes."""
+    if _is_retryable(exc):
+        return True
+    if isinstance(exc, HttpError):
+        info = parse_http_error(exc)
+        return info.status == 409 and info.reason in _ABORTED_409_REASONS
+    return False
+
+
 class RulesError(RuntimeError):
     """The rules file is missing, unreadable or invalid."""
 
@@ -528,7 +544,7 @@ class _Runner:
             raise _QuotaStop(f"not enough quota left today for {what} ({cost} units)")
         kwargs = {"sleep": self.sleep} if self.sleep is not None else {}
         retrying = Retrying(
-            retry=retry_if_exception(_is_retryable),
+            retry=retry_if_exception(_is_retryable_playlist_error),
             wait=_retry_wait,
             stop=stop_after_attempt(self.max_attempts),
             reraise=False,
