@@ -527,6 +527,7 @@ def ingest(
             taken_local_date=taken_local_date or "",
             dt_local=dt_local or datetime.now(config.tzinfo),
             video_stem=video_path.stem,
+            caption=meta_desc,
         )
 
         description = format_description(

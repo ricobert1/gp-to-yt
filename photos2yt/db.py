@@ -828,3 +828,28 @@ def record_playlist_item_added(
             """,
             (video_id, playlist_name, position),
         )
+
+
+# Statuses whose title may still be changed locally: not on YouTube yet and no
+# upload in progress. UPLOADING is excluded on purpose: crash recovery finds an
+# already-uploaded video by its exact title.
+RETITLABLE_STATUSES = ("PENDING", "FAILED", "SKIPPED")
+
+
+def update_video_title(conn: sqlite3.Connection, video_id: int, title: str) -> bool:
+    """Set a row's title if it has not started uploading. Returns True if changed.
+
+    Only rows in RETITLABLE_STATUSES with no saved resumable session are
+    touched: a saved session already carries the old title to YouTube.
+    """
+    placeholders = ", ".join("?" for _ in RETITLABLE_STATUSES)
+    with conn:
+        cur = conn.execute(
+            f"""
+            UPDATE videos SET title = ?, updated_at = ?
+            WHERE id = ? AND status IN ({placeholders})
+              AND upload_session_uri IS NULL AND (title IS NULL OR title != ?)
+            """,
+            (title, _iso_now(), video_id, *RETITLABLE_STATUSES, title),
+        )
+    return cur.rowcount == 1

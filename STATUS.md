@@ -91,6 +91,30 @@
   again. Same for playlists.insert (a second playlist with the same name). The window is
   small; no reads are done to check, to save quota.
 
+## Titles and `photos2yt retitle`
+- Google Takeout's sidecar `title` is just the file name, so titles used to read
+  "2020-12-24 - IMG_6791". Now `{title}` in youtube.title_template is chosen in this order:
+  1. first non-empty line of the Google Photos description (the caption), if any;
+  2. the sidecar title / file name, unless it is a camera-generated name (IMG_1234,
+     VID_..., PXL_..., MVI_, DSC, GOPR, DJI, timestamp names, UUIDs, digits only, ...;
+     see metadata.is_meaningless_name);
+  3. youtube.default_title.
+- New template placeholders (local time): {day_num} {month_name} {month_short} {weekday}
+  {weekday_short} {time} {default_title}, plus the old {title} {date} {year} {month} {day}.
+- New example template: "{title} – {weekday}, {month_name} {day_num}, {year} {time}" ->
+  "Family Video – Thursday, December 24, 2020 6:15 PM". The time keeps titles nearly
+  unique, which crash recovery relies on (it adopts an upload by exact title). Two videos
+  started in the same minute still get the same title.
+- A long caption is shortened so the date part still fits in 100 characters; '<' and
+  '>' are removed (YouTube rejects them).
+- Existing config.yaml files keep their own template; change it by hand.
+- `photos2yt retitle [--dry-run]` rebuilds titles with the current config for rows that
+  are PENDING, FAILED or SKIPPED and have no saved upload session. UPLOADING rows are left
+  alone (crash recovery needs the exact title sent); UPLOADED/PLAYLISTED videos are on
+  YouTube already (rename in Studio). A row whose sidecar can no longer be read keeps its
+  title (the caption would be lost). Database only, no API calls; --dry-run opens the DB
+  read-only.
+
 ## How the uploader behaves (Task 6)
 - Run order: recover rows stuck in UPLOADING, then upload PENDING rows by (taken_utc, id).
 - Before each upload: `can_afford(upload_cost_units, uploads=1)`. If not: stop, or with

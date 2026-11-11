@@ -23,7 +23,7 @@ def test_load_example_config():
     assert cfg.youtube.privacy == "unlisted"
     assert cfg.youtube.category_id == "22"
     assert cfg.youtube.made_for_kids is False
-    assert cfg.youtube.title_template == "{date} - {title}"
+    assert cfg.youtube.title_template == "{title} – {weekday}, {month_name} {day_num}, {year} {time}"
     assert cfg.youtube.default_title == "Family Video"
 
     assert cfg.quota.daily_unit_limit == 10000
