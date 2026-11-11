@@ -29,6 +29,9 @@
 - `curate`: playlist created and stored, video added at position 0, membership added=1,
   row PLAYLISTED, quota counter +100. Playlist and video visible in Studio.
 - `curate` re-run: no API calls, quota counter unchanged.
+- Ordering test, first run on a new playlist: the first add got HTTP 409
+  SERVICE_UNAVAILABLE "The operation was aborted." (not retried at the time, so counted as
+  a failure); the second add went in at position 0. Now retried (see curator section).
 
 ## Next
 - Manual (optional): curate a rule matching 2-3 videos and check the order in Studio.
@@ -59,6 +62,9 @@
   one add is counted and the run continues; the row stays added=0 and is retried on the next
   run. A failed playlists.insert skips only that playlist. playlistNotFound (playlist
   deleted on YouTube) skips the rest of that playlist and says how to re-create it.
+- Retries: like the uploader (5xx, 429, rate-limit 403s, network errors), plus HTTP 409
+  reason SERVICE_UNAVAILABLE ("The operation was aborted."), which YouTube returned on a
+  real playlistItems.insert right after playlists.insert (2026-11-11). Other 409s fail.
 - Quota: `can_afford(cost)` before every call (local stop, day not marked exhausted);
   quotaExceeded -> `mark_exhausted()` and stop. Costs from config (playlist_insert_cost,
   playlist_item_insert_cost) recorded after every call that got an HTTP response, including

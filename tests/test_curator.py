@@ -553,6 +553,27 @@ def test_transient_errors_are_retried(conn, config, tracker, tmp_path):
     assert len(yt.item_inserts()) == 2
 
 
+def test_aborted_409_is_retried(conn, config, tracker, tmp_path):
+    """YouTube's 409 SERVICE_UNAVAILABLE ("The operation was aborted") on a
+    playlist write is transient: retried, not counted as a failure."""
+    v = add_video(conn, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25")
+    yt = FakeYouTube()
+    yt.item_script[record(conn, v).youtube_video_id] = [
+        http_error(409, "SERVICE_UNAVAILABLE", "The operation was aborted."), None]
+    summary, _, _ = run(conn, config, tracker, yt, xmas_rules(tmp_path))
+    assert summary.added == 1 and summary.failed == 0
+    assert len(yt.item_inserts()) == 2
+    assert record(conn, v).status.value == "PLAYLISTED"
+
+
+def test_other_409_is_not_retried(conn, config, tracker, tmp_path):
+    v = add_video(conn, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25")
+    yt = FakeYouTube()
+    yt.item_script[record(conn, v).youtube_video_id] = [http_error(409, "conflict"), None]
+    summary, _, _ = run(conn, config, tracker, yt, xmas_rules(tmp_path))
+    assert summary.failed == 1 and len(yt.item_inserts()) == 1
+
+
 def test_retries_exhausted_counts_as_failure(conn, config, tracker, tmp_path):
     v = add_video(conn, taken_utc="2024-12-25T15:00:00Z", local_date="2024-12-25")
     yt = FakeYouTube()
