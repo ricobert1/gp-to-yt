@@ -42,8 +42,6 @@
 - Manual (Task 9, Docker, optional): `docker compose build` and
   `docker compose run --rm photos2yt --help` if Docker is used later. Still never built
   with the apt ffmpeg step anywhere.
-- Manual (Mac schedule): `uv run python scripts/launchd.py install`, then `run-now` and
-  `status`; check logs/nightly.log and that a failed run shows a notification.
 
 ## Packaging (Task 9)
 - Dockerfile: python:3.12-slim + apt ffmpeg (ffprobe) + tzdata; uv 0.11.32 copied from the
@@ -79,8 +77,12 @@
   repo/config.yaml; UPLOAD_LIMIT; WorkingDirectory = repo (ingest_report.csv there); output
   appended to logs/nightly.log (gitignored). Default time: 00:30 America/Los_Angeles
   converted to the Mac's zone at install time (StartCalendarInterval is local time; correct
-  across DST in US zones). Tested with a fake launchctl and a temp home (not run on a real
-  Mac yet). Known macOS limit: TCC blocks launchd jobs from Desktop/Documents/Downloads and
+  across DST in US zones). Tested with a fake launchctl and a temp home, and on the real Mac
+  (2026-11-11, by the human): `install` chose 03:30 local (= 00:30 Pacific, Mac in US
+  Eastern), `run-now` ran the whole nightly job from launchd (repo at ~/gp-to-yt, not a
+  TCC-protected folder), `status` showed "Loaded in launchd: yes", last exit code 0, and the
+  log ended with the report (6 videos in the manifest, nothing needing attention) and
+  "nightly done, exit 0". The failure notification has not been seen yet (no failed run). Known macOS limit: TCC blocks launchd jobs from Desktop/Documents/Downloads and
   removable volumes; README says to move the folders or grant Full Disk Access.
 - Scheduling: host cron / NAS task scheduler runs
   `docker compose run --rm --entrypoint photos2yt-nightly photos2yt`; no cron daemon inside
