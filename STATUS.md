@@ -15,6 +15,8 @@
   read-only dry run. Awaiting human review. Not yet tested against the real API: the
   task's manual acceptance step ("upload one real short file") is still to do.
   Update 2026-11-11: done by the human, see "Real-API checks" below.
+- Task 8: `photos2yt reconcile` and `photos2yt report` (this branch). Awaiting human review;
+  not yet run against the real API (see "Next").
 - Task 7B: curator real run (`photos2yt curate`), plus curate --dry-run read-only fix and
   rules path from config/CLI. Awaiting human review of the diff. Checked against the real
   API (see below).
@@ -35,7 +37,71 @@
 
 ## Next
 - Manual (optional): curate a rule matching 2-3 videos and check the order in Studio.
-- Task 8 (not started).
+- Manual (Task 8): `reconcile --dry-run`, then `reconcile` against the real channel (expect
+  1 unit per 50 videos), then `report`; check manifest.csv against Studio.
+- Task 9 (not started).
+
+## How reconcile behaves (Task 8)
+- Checks rows in status UPLOADED **and PLAYLISTED** that have a youtube_video_id. PLAYLISTED
+  rows are uploaded videos too (PLAYLISTED only means the playlist adds are done), and they are
+  the majority once curate has run, so checking only UPLOADED would miss most deletions.
+  Rows in other statuses have nothing on YouTube to check (an UPLOADING row's id is handled by
+  upload's crash recovery).
+- `videos.list(part=status,processingDetails,recordingDetails, id=<up to 50 comma-separated
+  ids>)`, 1 unit per call (same cost constant as the uploader's verification call). No
+  maxResults (not allowed with id), no paging, never search.list. Repeated ids are sent once.
+- Per returned video:
+  - actual_privacy refreshed (db.update_video_verification); a change since the last stored
+    value is printed; a privacy different from `youtube.privacy` in config is flagged
+    (private-upload lock, AGENT_RULES fact 1, or changed in Studio). Not written to
+    last_error: actual_privacy already holds it, and report derives it from there.
+  - recordingDate re-check: `recordingDetails.recordingDate` vs taken_utc, UTC date part only
+    (YouTube may drop the time). Missing (including "still processing", which is said in the
+    note) or different -> flagged and noted. This is the follow-up to the 2026-11-11 finding
+    that videos.list can omit the date right after upload. YouTube is never modified.
+  - status.uploadStatus deleted/failed/rejected -> flagged and noted (with rejectionReason /
+    failureReason if given). Costs nothing extra (status part is fetched anyway).
+- An id not returned by videos.list = **missing** (deleted or removed on YouTube). Decision:
+  the row keeps its status and is not deleted. There is no legal transition out of
+  PLAYLISTED, and UPLOADED -> PLAYLISTED would be a lie; moving it back to PENDING would
+  re-upload automatically, which a human should decide (the video may have been removed on
+  purpose). Instead last_error gets a note `[reconcile YYYY-MM-DD] missing on YouTube (...)`
+  (db.set_reconcile_note; never touches status, only UPLOADED/PLAYLISTED rows). report lists
+  it under "needs attention" and in the manifest's attention column.
+- Notes: problems for one row are joined with "; " into one `[reconcile <UTC date>] ...`
+  note. A later clean check clears the note, but only a last_error that starts with
+  `[reconcile` (an older non-reconcile last_error, e.g. from a failed earlier attempt, is
+  kept unless a new problem overwrites it).
+- Quota: can_afford(1) before every call; recorded after every call that got a response
+  (also rejected ones, like curate). quotaExceeded -> mark_exhausted(), stop, exit 0; rows
+  not reached are counted as "not checked" and left unchanged. A day already marked
+  exhausted stops before any call. Retries: the uploader's (5xx, 429, rate-limit 403s,
+  network; Retry-After honoured). Other errors fail that batch only: its rows are left
+  unchanged (never marked missing) and the run continues. Exit 1 if any call failed;
+  videos needing attention are not a failure (exit 0).
+- Credentials: the API client is built lazily, so a DB with nothing to check needs no
+  token. No DB file -> "nothing to reconcile", the DB is not created.
+- `--dry-run`: read-only DB (get_readonly_connection; never created or migrated), no
+  credentials, no API calls. Prints each row that would be checked, the number of calls,
+  estimated units and remaining quota from the local counter.
+
+## How report behaves (Task 8)
+- `photos2yt report [--out-dir DIR]`: reads the DB only (read-only connection; never created
+  or migrated; no API calls, no credentials). Writes `manifest.csv` and `summary.txt` into
+  DIR, default the config file's directory (CWD if the config has no path), and prints the
+  summary. Both names are in .gitignore (they contain file names).
+- manifest.csv: one row per UPLOADED/PLAYLISTED video with an id, ordered by taken_utc.
+  Columns: original_filename, video_id, url (`https://youtu.be/<id>`), privacy
+  (actual_privacy as last read back; empty = never verified), playlists (`; `-separated,
+  playlist_membership added=1 joined with playlists), then extra columns status,
+  taken_local_date, source_path (file names repeat across Takeout folders) and attention.
+- summary.txt: counts by status (+ how many SKIPPED are duplicates), total, number in the
+  manifest; quota today (Pacific day, local counter: units of daily_unit_limit, uploads of
+  daily_upload_limit, exhausted flag); "needs attention": FAILED (last_error), UPLOADING
+  (interrupted; next upload recovers it), SKIPPED that are not duplicates (e.g. > 15 min),
+  reconcile notes (missing, recordingDate, uploadStatus), privacy different from config,
+  privacy never verified, playlist adds not done yet (membership added=0).
+- Run `reconcile` first for fresh privacy / missing information; report does not call the API.
 
 ## How the curator behaves (Task 7)
 - Rules file: `curate --rules PATH`, else `paths.rules` in config.yaml (new optional key,
@@ -164,7 +230,13 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
 - db.update_upload_session() (from task6-rewrite) persists the session URI; no-op unless
   the row is UPLOADING, None clears it.
 - New db helpers: update_video_verification, get_video_by_youtube_id,
-  get_readonly_connection, record_playlist_item_added (Task 7B).
+  get_readonly_connection, record_playlist_item_added (Task 7B), set_reconcile_note and
+  RECONCILE_NOTE_PREFIX (Task 8). No schema change in Task 8.
+- curate --dry-run with no rules configured now says "no playlist rules are configured"
+  instead of "every matching video is already in its playlists".
+- Task 8 imports helpers from uploader.py (parse_http_error, _is_retryable, _retry_wait,
+  _safe_error_text, _format_recording_date, VERIFY_COST_UNITS, PRIVATE_LOCK_EXPLANATION)
+  but does not change uploader.py.
 - Tests no longer write photos2yt/rules.yaml (all rules files under tmp_path; an autouse
   fixture fails any test that touches it). .gitignore now ignores `rules.yaml` (local
   rules next to config.yaml) instead of photos2yt/rules.yaml.
@@ -210,5 +282,14 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
   over the next few uploads.
 - Is 4 pages (200 newest uploads) the right adoption search depth? It costs up to 5 units
   per stuck row.
+- Reconcile: should a missing video (deleted on YouTube) make the exit code non-zero, so a
+  nightly cron run alerts? Currently exit 0 and it is only reported.
+- Reconcile: should a missing video be re-queued for upload (would need a new
+  UPLOADED/PLAYLISTED -> PENDING transition and clearing its playlist memberships)?
+  Currently left for a human.
+- Report: the manifest lists only videos on YouTube. Duplicate files (SKIPPED with
+  duplicate_of) are covered by their original's row but not listed themselves; should they
+  get a manifest row pointing at the original's video id (useful for the Google Photos
+  deletion checklist)?
 - Curator: should a playlist deleted on YouTube be re-created automatically? Currently it
   is reported and left for a human (delete its row in `playlists`).

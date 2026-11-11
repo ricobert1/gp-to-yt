@@ -78,10 +78,21 @@ def create_parser() -> argparse.ArgumentParser:
                                 help="Show old -> new titles; database opened read-only")
 
     # reconcile command (Task 8)
-    subparsers.add_parser("reconcile", help="Reconcile local database with remote YouTube videos")
+    reconcile_parser = subparsers.add_parser(
+        "reconcile",
+        help="Check uploaded videos still exist on YouTube (videos.list) and refresh privacy",
+    )
+    reconcile_parser.add_argument("--dry-run", action="store_true",
+                                  help="List what would be checked and the estimated units; "
+                                       "no API calls, no credentials, database opened read-only")
 
     # report command (Task 8)
-    subparsers.add_parser("report", help="Generate summary and manifest report")
+    report_parser = subparsers.add_parser(
+        "report", help="Write manifest.csv and summary.txt from the database (no API calls)"
+    )
+    report_parser.add_argument("--out-dir", dest="out_dir", default=None,
+                               help="Directory for manifest.csv and summary.txt "
+                                    "(default: the config file's directory)")
 
     return parser
 
@@ -267,6 +278,86 @@ def run_retitle_command(config, *, dry_run: bool = False) -> int:
     return 0
 
 
+def run_reconcile_command(
+    config,
+    *,
+    dry_run: bool = False,
+    youtube_factory=None,
+    sleep=None,
+) -> int:
+    """Implements `photos2yt reconcile`. Returns the process exit code.
+
+    --dry-run: no credentials, no API client, database opened read-only (never
+    created or migrated). Otherwise credentials are loaded only if there is a
+    video to check. Exit code 1 if any videos.list call failed, else 0 (a
+    clean quota stop and videos needing attention are not failures).
+    """
+    from photos2yt.db import get_connection, get_readonly_connection, init_db
+    from photos2yt.quota import QuotaTracker
+    from photos2yt.reconcile import format_dry_run, run_reconcile
+
+    db_path = config.paths.db_path
+    if dry_run:
+        try:
+            conn = get_readonly_connection(db_path)
+        except FileNotFoundError:
+            print(f"[DRY RUN] No database at {db_path}; nothing to reconcile.")
+            return 0
+        try:
+            print(format_dry_run(conn, config, QuotaTracker(conn, config)))
+        finally:
+            conn.close()
+        return 0
+
+    if not db_path.exists():
+        print(f"No database at {db_path}; nothing to reconcile.")
+        return 0
+
+    if youtube_factory is None:
+        def youtube_factory():
+            creds = get_credentials(config=config)
+            return get_youtube_service(config=config, credentials=creds)
+
+    conn = init_db(get_connection(db_path))
+    try:
+        tracker = QuotaTracker(conn, config)
+        summary = run_reconcile(conn, config, tracker, youtube_factory, sleep=sleep)
+    finally:
+        conn.close()
+    return 1 if summary.failed_batches else 0
+
+
+def default_report_dir(config) -> Path:
+    """Next to the config file, else the current directory."""
+    if getattr(config, "config_path", None):
+        return Path(config.config_path).resolve().parent
+    return Path.cwd()
+
+
+def run_report_command(config, *, out_dir: Optional[str | Path] = None) -> int:
+    """Implements `photos2yt report`. Reads the database only (read-only
+    connection, never created or migrated); writes manifest.csv and
+    summary.txt into ``out_dir``."""
+    from photos2yt.db import get_readonly_connection
+    from photos2yt.report import format_summary, write_report
+
+    target = Path(out_dir) if out_dir is not None else default_report_dir(config)
+    try:
+        conn = get_readonly_connection(config.paths.db_path)
+    except FileNotFoundError:
+        print(f"No database at {config.paths.db_path}; nothing to report.")
+        return 0
+    try:
+        report, manifest, summary = write_report(conn, config, target)
+    finally:
+        conn.close()
+    print(format_summary(report))
+    print("")
+    print(f"Manifest written to: {manifest} ({len(report.manifest_rows)} video(s))")
+    print(f"Summary written to:  {summary}")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     configure_logging()
     parser = create_parser()
@@ -320,6 +411,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.subcommand == "curate":
             return run_curate_command(config, dry_run=args.dry_run, rules_path=args.rules_path)
+
+        if args.subcommand == "reconcile":
+            return run_reconcile_command(config, dry_run=args.dry_run)
+
+        if args.subcommand == "report":
+            return run_report_command(config, out_dir=args.out_dir)
 
         print(f"Command '{args.subcommand}' not yet implemented. Configuration loaded successfully.")
         return 0

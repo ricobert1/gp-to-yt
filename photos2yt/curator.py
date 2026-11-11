@@ -457,7 +457,9 @@ def format_plan(plan: CurationPlan, config: Optional[Config] = None, tracker: Op
                 f"    position {a.position}: row {a.video.id}  {a.video.taken_local_date or '?'}  "
                 f"{a.video.title or ''}"
             )
-    if plan.is_empty:
+    if plan.is_empty and not plan.playlists:
+        lines.append("  Nothing to do: no playlist rules are configured.")
+    elif plan.is_empty:
         lines.append("  Nothing to do: every matching video is already in its playlists.")
     else:
         lines.append(

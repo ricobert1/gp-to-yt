@@ -36,6 +36,7 @@ token*.json
 config.yaml
 ingest_report.csv
 manifest.csv
+summary.txt
 
 # macOS
 .DS_Store
