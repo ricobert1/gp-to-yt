@@ -32,6 +32,9 @@ class PathsConfig:
     # Playlist rules file for `photos2yt curate`. None = not set in config;
     # the curator then uses rules.yaml next to the config file.
     rules: Optional[Path] = None
+    # Where `photos2yt cleanup` moves originals that are confirmed on YouTube.
+    # None = not set; cleanup then uses "<staging_dir>-uploaded" next to staging_dir.
+    uploaded_dir: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,10 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
         if rules_val is not None and not str(rules_val).strip():
             errors.append("paths.rules, if given, cannot be empty")
 
+        uploaded_val = paths_data.get("uploaded_dir")
+        if uploaded_val is not None and not str(uploaded_val).strip():
+            errors.append("paths.uploaded_dir, if given, cannot be empty")
+
         if not errors:  # If no errors so far in paths, construct PathsConfig
             paths_obj = PathsConfig(
                 staging_dir=_resolve_path(str(paths_data["staging_dir"]), base_dir),
@@ -107,6 +114,8 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
                 credentials=_resolve_path(str(paths_data["credentials"]), base_dir),
                 token=_resolve_path(str(paths_data["token"]), base_dir),
                 rules=_resolve_path(str(rules_val), base_dir) if rules_val is not None else None,
+                uploaded_dir=(_resolve_path(str(uploaded_val), base_dir)
+                              if uploaded_val is not None else None),
             )
 
     # 2. Validate 'timezone'

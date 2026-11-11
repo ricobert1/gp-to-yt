@@ -315,3 +315,11 @@ def test_upload_order_defaults_to_largest_first_and_parses():
 def test_upload_order_invalid(bad):
     with pytest.raises(ConfigError, match="upload_order"):
         validate_and_parse_config(_raw_with_youtube(upload_order=bad))
+
+
+def test_uploaded_dir_optional_and_relative_to_config(tmp_path):
+    raw = _raw_with_youtube()
+    assert validate_and_parse_config(raw, base_dir=tmp_path).paths.uploaded_dir is None
+    raw["paths"]["uploaded_dir"] = "done"
+    cfg = validate_and_parse_config(raw, base_dir=tmp_path)
+    assert cfg.paths.uploaded_dir == (tmp_path / "done").resolve()

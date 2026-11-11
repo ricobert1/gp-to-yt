@@ -22,7 +22,8 @@ Contents: [Google Cloud setup](#1-google-cloud-setup) ·
 [Docker](#5-running-with-docker) · [Nightly schedule](#6-nightly-schedule) (cron, Mac launchd) ·
 [Private-upload lock](#7-the-private-upload-lock-and-the-api-audit) ·
 [3-video test run](#8-end-to-end-test-on-a-3-video-sample) ·
-[Offload checklist](#9-manual-offload-checklist)
+[Local cleanup](#9-cleaning-up-local-originals-photos2yt-cleanup) ·
+[Offload checklist](#10-manual-offload-checklist)
 
 ---
 
@@ -84,6 +85,7 @@ file. The important keys:
 |---|---|
 | `paths.staging_dir` | The extracted Takeout `Google Photos` folder (only read, never changed). |
 | `paths.db_path` | The SQLite queue (`queue.db`). Back it up: it is the record of what was uploaded. |
+| `paths.uploaded_dir` | Where `cleanup` moves originals (optional; default `<staging_dir>-uploaded` next to the staging folder). |
 | `paths.rules` | Playlist rules for `curate`. If this key is set the file must exist (see below). |
 | `timezone` | Your local time zone; decides local dates for titles and playlist rules. |
 | `youtube.privacy` | Requested privacy (`private`, `unlisted`, `public`). See section 7. |
@@ -109,6 +111,8 @@ photos2yt [-c config.yaml] <command>
   retitle [--dry-run]         rebuild titles of videos not uploaded yet
   reconcile [--dry-run]       videos.list check of every uploaded video (1 unit per 50)
   report [--out-dir DIR]      manifest.csv + summary.txt (no API calls)
+  cleanup [--dry-run] [--delete --yes] [--dest DIR] [--max-age-days N]
+                              move local originals confirmed on YouTube out of staging_dir
 ```
 
 Without `-c`, the config comes from `$PHOTOS2YT_CONFIG`, else `./config.yaml`.
@@ -329,7 +333,31 @@ Do this once before the full migration. It uses about 5,000 units (3 uploads,
 7. Delete the three test videos and the test playlist in Studio if you do
    not want them, and delete `sample.db`.
 
-## 9. Manual offload checklist
+## 9. Cleaning up local originals (`photos2yt cleanup`)
+
+Frees disk space by moving the Takeout copies of videos that are safely on
+YouTube out of `staging_dir`, into `paths.uploaded_dir` (default: a folder
+named `<staging folder>-uploaded` next to it), keeping their sub-folders.
+
+```bash
+uv run photos2yt -c config.yaml reconcile          # confirms which videos exist on YouTube
+uv run photos2yt -c config.yaml cleanup --dry-run  # shows what would move, and why others stay
+uv run photos2yt -c config.yaml cleanup            # moves them
+```
+
+A file is moved only if its video is UPLOADED or PLAYLISTED, `reconcile`
+found it on YouTube in the last 7 days (`--max-age-days`), it has no open
+reconcile problem (missing, recording date, rejected), and the file still has
+the size it had at ingest. Duplicate copies go with their original; a sidecar
+`.json` goes when every video using it goes. Each move is logged to
+`cleanup_log.csv` next to the database; the database itself is not changed.
+
+`--delete --yes` deletes instead of moving. Prefer moving, check the files,
+then delete the `-uploaded` folder yourself; YouTube re-encodes videos, so it
+is not a backup of the originals. Cleanup does not run in the nightly job, and
+it cannot run in Docker as set up here (staging is mounted read-only).
+
+## 10. Manual offload checklist
 
 There is no API for deleting from Google Photos, and YouTube re-encodes
 uploads (it is not a lossless backup), so the last steps are manual.
@@ -343,5 +371,7 @@ uploads (it is not a lossless backup), so the last steps are manual.
 4. In `manifest.csv`, spot-check a few rows: open the URL, compare with the
    original.
 5. Back up `queue.db` and `manifest.csv` with the originals.
-6. Only then delete the videos from Google Photos (photos.google.com →
+6. Optionally run `photos2yt cleanup` (section 9) to move the local copies out of the
+   staging folder.
+7. Only then delete the videos from Google Photos (photos.google.com →
    select → Delete; they stay in the Bin for 60 days).

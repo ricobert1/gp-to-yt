@@ -677,10 +677,10 @@ class TestMigration3:
 
         conn2.close()
 
-    def test_schema_version_is_3(self):
-        """SCHEMA_VERSION in db.py is 3."""
-        from photos2yt.db import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 3
+    def test_schema_version_includes_3(self):
+        """Migration 3 exists and SCHEMA_VERSION is at least 3 (later migrations add more)."""
+        from photos2yt.db import MIGRATIONS, SCHEMA_VERSION
+        assert 3 in MIGRATIONS and SCHEMA_VERSION >= 3 and SCHEMA_VERSION == max(MIGRATIONS)
 
 
 # ===========================================================================
