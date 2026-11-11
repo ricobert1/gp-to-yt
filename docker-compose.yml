@@ -1,0 +1,25 @@
+# photos2yt with Docker Compose. Settings come from a .env file next to this
+# one (copy .env.example). See README.md, "Running with Docker".
+#
+#   docker compose build
+#   docker compose run --rm photos2yt --help
+#   docker compose run --rm photos2yt upload --dry-run
+#   docker compose run --rm --entrypoint photos2yt-nightly photos2yt   # nightly job
+services:
+  photos2yt:
+    build: .
+    image: photos2yt:latest
+    # Run as you, so the database, token and reports stay owned by you.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      PHOTOS2YT_CONFIG: /config/config.yaml
+      UPLOAD_LIMIT: "${UPLOAD_LIMIT:-5}"
+      RECONCILE: "${RECONCILE:-0}"
+    volumes:
+      # Google Takeout "Google Photos" folder: read-only, never modified.
+      - "${STAGING_DIR:?set STAGING_DIR in .env}:/staging:ro"
+      # config.yaml, credentials.json, token.json (writable: refreshed tokens
+      # are saved back), rules.yaml; report writes manifest.csv/summary.txt here.
+      - "${CONFIG_DIR:-./docker-data/config}:/config"
+      # queue.db (the source of truth: back this folder up) and ingest_report.csv.
+      - "${DATA_DIR:-./docker-data/data}:/data"

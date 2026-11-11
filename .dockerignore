@@ -1,0 +1,20 @@
+# Keep secrets, local data and dev files out of the build context and image.
+.git
+.venv
+venv
+**/__pycache__
+*.egg-info
+.pytest_cache
+tests
+docker-data
+config.yaml
+rules.yaml
+credentials*.json
+token*.json
+*.db
+*.db-*
+*.sqlite*
+*.csv
+summary.txt
+.aider*
+.DS_Store
