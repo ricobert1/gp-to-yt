@@ -18,3 +18,4 @@ token*.json
 summary.txt
 .aider*
 .DS_Store
+logs

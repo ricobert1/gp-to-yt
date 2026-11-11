@@ -19,7 +19,7 @@ command that changes something has `--dry-run`.
 Contents: [Google Cloud setup](#1-google-cloud-setup) ·
 [Install and first auth](#2-install-and-authorize-on-a-desktop) ·
 [Configure](#3-configure) · [Commands](#4-commands) ·
-[Docker](#5-running-with-docker) · [Nightly schedule](#6-nightly-schedule) ·
+[Docker](#5-running-with-docker) · [Nightly schedule](#6-nightly-schedule) (cron, Mac launchd) ·
 [Private-upload lock](#7-the-private-upload-lock-and-the-api-audit) ·
 [3-video test run](#8-end-to-end-test-on-a-3-video-sample) ·
 [Offload checklist](#9-manual-offload-checklist)
@@ -202,8 +202,47 @@ that in your local time, e.g. 03:30 for US Eastern:
 ```
 
 Most schedulers can e-mail on a non-zero exit; that is how failures reach you.
-Without Docker, the same script works with uv:
-`PATH="$PWD/.venv/bin:$PATH" PHOTOS2YT_CONFIG=$PWD/config.yaml sh scripts/nightly.sh`.
+
+### Without Docker
+
+The same script runs with uv. From the repository folder:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" PHOTOS2YT_CONFIG="$PWD/config.yaml" sh scripts/nightly.sh; echo "exit $?"
+```
+
+Put `UPLOAD_LIMIT=0` in front for a run that uploads nothing.
+
+### On a Mac: launchd (no Docker, no Homebrew)
+
+`scripts/launchd.py` installs a launchd job (macOS's built-in scheduler) that
+runs the line above every night:
+
+```bash
+uv run python scripts/launchd.py install            # default: 00:30 Pacific in your time zone, 5 uploads
+uv run python scripts/launchd.py install --time 03:45 --limit 3   # or choose
+uv run python scripts/launchd.py run-now            # one run right away, to test it
+uv run python scripts/launchd.py status             # time, last exit code, last log lines
+uv run python scripts/launchd.py uninstall          # stop and remove it
+```
+
+- Output goes to `logs/nightly.log` in the repository folder. A run that
+  exits non-zero shows a macOS notification ("photos2yt: The nightly run
+  failed").
+- The job uses this folder's `.venv` and `config.yaml`, and the `ffprobe`
+  found on your PATH when you ran `install`. If you move the folder or
+  change `ffprobe`, run `install` again.
+- If the Mac is asleep at the scheduled time, the job runs when it wakes. If
+  it is shut down, that night is skipped. It runs only while you are logged in.
+- The time is fixed in your Mac's local time. In a US time zone it stays
+  right across daylight-saving changes; elsewhere, re-run `install` after a
+  change.
+- **macOS privacy:** scheduled jobs cannot read the Desktop, Documents or
+  Downloads folders, or external drives, unless allowed. If `run-now` logs
+  "Operation not permitted", either move the repository and the Takeout
+  folder elsewhere (e.g. `~/photos2yt/`), or allow it in System Settings →
+  Privacy & Security → Full Disk Access (add `/bin/sh`; that gives every
+  shell script full disk access, so moving the folders is the safer choice).
 
 ## 7. The private-upload lock and the API audit
 
