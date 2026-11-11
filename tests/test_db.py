@@ -608,3 +608,52 @@ def test_update_upload_session_missing_video():
     conn = init_db(get_connection(":memory:"))
     with pytest.raises(VideoNotFoundError):
         update_upload_session(conn, 999, "https://example/session")
+
+
+# --- verification / lookup / read-only helpers (Task 6 part 2) ---
+
+def test_update_video_verification_only_for_uploaded():
+    from photos2yt.db import DatabaseError, update_video_verification
+
+    conn = init_db(get_connection(":memory:"))
+    vid = insert_video(conn, source_path="/v.mp4", sha256="v1", size_bytes=1)
+    with pytest.raises(DatabaseError):
+        update_video_verification(conn, vid, actual_privacy="private")
+    transition_video_status(conn, vid, VideoStatus.UPLOADING)
+    transition_video_status(conn, vid, VideoStatus.UPLOADED, youtube_video_id="yt1")
+    rec = update_video_verification(conn, vid, actual_privacy="private")
+    assert rec.actual_privacy == "private"
+    assert rec.status == VideoStatus.UPLOADED
+    with pytest.raises(VideoNotFoundError):
+        update_video_verification(conn, 999, actual_privacy="private")
+
+
+def test_get_video_by_youtube_id():
+    from photos2yt.db import get_video_by_youtube_id
+
+    conn = init_db(get_connection(":memory:"))
+    vid = insert_video(conn, source_path="/w.mp4", sha256="w1", size_bytes=1)
+    transition_video_status(conn, vid, VideoStatus.UPLOADING)
+    transition_video_status(conn, vid, VideoStatus.UPLOADED, youtube_video_id="yt-w")
+    assert get_video_by_youtube_id(conn, "yt-w").id == vid
+    assert get_video_by_youtube_id(conn, "nope") is None
+
+
+def test_get_readonly_connection(tmp_path):
+    from photos2yt.db import get_readonly_connection
+
+    with pytest.raises(FileNotFoundError):
+        get_readonly_connection(tmp_path / "missing.db")
+    assert not (tmp_path / "missing.db").exists()
+
+    path = tmp_path / "q.db"
+    c = init_db(get_connection(path))
+    insert_video(c, source_path="/r.mp4", sha256="r1", size_bytes=1)
+    c.close()
+    files_before = sorted(p.name for p in tmp_path.iterdir())
+    ro = get_readonly_connection(path)
+    assert len(get_videos_by_status(ro, VideoStatus.PENDING)) == 1
+    with pytest.raises(sqlite3.OperationalError):
+        ro.execute("DELETE FROM videos")
+    ro.close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == files_before

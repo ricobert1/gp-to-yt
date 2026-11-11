@@ -11,8 +11,10 @@ Scope of this module (part 1):
   * drive the row through PENDING -> UPLOADING -> UPLOADED / PENDING / FAILED,
   * record quota only after a successful upload.
 
-Not here yet (part 2): post-upload verification read-back (private lock),
-crash recovery / resuming a stored session URI, and the CLI run loop.
+Part 2 adds: post-upload verification read-back (private lock, recordingDate),
+crash recovery for rows stuck in UPLOADING (resume a saved session, or adopt
+an already-uploaded video found in the channel's uploads playlist), the
+``photos2yt upload`` run loop, and a read-only dry run.
 
 Secrets: this module never logs or stores OAuth tokens. The resumable session
 URI is stored in the DB (needed for resume) but is never logged, and
@@ -28,7 +30,7 @@ import logging
 import socket
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Optional
@@ -49,8 +51,12 @@ from photos2yt.config import Config
 from photos2yt.db import (
     VideoRecord,
     VideoStatus,
+    get_readonly_connection,
+    get_video_by_youtube_id,
+    get_videos_by_status,
     transition_video_status,
     update_upload_session,
+    update_video_verification,
 )
 from photos2yt.quota import QuotaTracker
 
@@ -80,6 +86,9 @@ NETWORK_ERRORS: tuple[type[BaseException], ...] = (
     httplib2.HttpLib2Error,
 )
 
+# Statuses that mean a saved resumable session is expired or unusable.
+SESSION_GONE_STATUS_CODES = frozenset({400, 404, 410})
+
 _MAX_ERROR_LEN = 500
 
 
@@ -101,6 +110,10 @@ class UploadLimitExceededError(UploaderError):
 
 class UploadRetriesExhaustedError(UploaderError):
     """A chunk kept failing with transient errors after all retry attempts."""
+
+
+class SessionGoneError(UploaderError):
+    """A saved resumable session can no longer be used (expired / invalid)."""
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +333,41 @@ def upload_one(
             conn, video.id, VideoStatus.FAILED, error=error[:_MAX_ERROR_LEN]
         )
 
+    return _run_upload(
+        conn, config, tracker, youtube, video, media,
+        max_attempts=max_attempts, sleep=sleep,
+    )
+
+
+def _run_upload(
+    conn,
+    config: Config,
+    tracker: QuotaTracker,
+    youtube,
+    video: VideoRecord,
+    media: MediaFileUpload,
+    *,
+    max_attempts: int,
+    sleep: Callable[[float], None],
+    resume_uri: Optional[str] = None,
+) -> VideoRecord:
+    """Drive a resumable upload for a row that is already UPLOADING.
+
+    Shared by upload_one (fresh session) and crash recovery (``resume_uri``
+    set: the saved session is queried for its received byte range first and
+    the upload continues from there; if it already completed, the server
+    returns the finished video).
+
+    Raises SessionGoneError (resume only) when the saved session is no
+    longer valid; the row is left UPLOADING for the caller to handle.
+    """
     request = youtube.videos().insert(
         part=UPLOAD_PARTS,
         body=build_request_body(video, config),
         media_body=media,
     )
+    if resume_uri is not None:
+        _prime_resume(request, resume_uri)
 
     persisted_uri: Optional[str] = video.upload_session_uri
 
@@ -381,6 +424,13 @@ def upload_one(
         transition_video_status(conn, video.id, VideoStatus.FAILED, error=error)
         raise UploadRetriesExhaustedError(error) from last
     except HttpError as exc:
+        if resume_uri is not None:
+            info = parse_http_error(exc)
+            if info.status in SESSION_GONE_STATUS_CODES and info.reason not in (
+                "quotaExceeded",
+                "uploadLimitExceeded",
+            ):
+                raise SessionGoneError(_safe_error_text(info)) from exc
         return _handle_http_error(conn, tracker, video, exc)
 
     video_id = response.get("id") if isinstance(response, dict) else None
@@ -400,6 +450,23 @@ def upload_one(
     tracker.record(config.quota.upload_cost_units, uploads=1)
     logger.info("Video %s: uploaded as YouTube id %s", video.id, video_id)
     return updated
+
+
+def _prime_resume(request, resume_uri: str) -> None:
+    """Point a fresh insert request at a saved session and make the next
+    next_chunk() first ask the server how many bytes it already has.
+
+    googleapiclient has no public "resume this URI" API. Setting the public
+    ``resumable_uri`` attribute skips session creation; the private
+    ``_in_error_state`` flag makes next_chunk() send the protocol's status
+    query (PUT, Content-Range: bytes */size) instead of blindly re-sending
+    from byte 0. If the library ever drops that attribute we refuse to
+    resume (SessionGoneError) rather than risk a corrupt upload.
+    """
+    if not hasattr(request, "_in_error_state"):
+        raise SessionGoneError("client library does not support resuming a saved session")
+    request.resumable_uri = resume_uri
+    request._in_error_state = True
 
 
 def _handle_http_error(
@@ -422,3 +489,472 @@ def _handle_http_error(
 
     logger.error("Video %s: upload failed: %s", video.id, error)
     return transition_video_status(conn, video.id, VideoStatus.FAILED, error=error)
+
+
+# ===========================================================================
+# Part 2: verification, crash recovery, run loop, dry run
+# ===========================================================================
+
+VERIFY_PARTS = "status,processingDetails,recordingDetails"
+VERIFY_COST_UNITS = 1  # videos.list
+LIST_COST_UNITS = 1  # channels.list / playlistItems.list, per page
+MAX_UNVERIFIED_DURATION_S = 15 * 60  # platform rule: > 15 min needs a verified channel
+# How many pages (50 items each) of the uploads playlist to scan, newest first,
+# when looking for a video that a crashed run may already have uploaded.
+DEFAULT_ADOPTION_MAX_PAGES = 4
+
+PRIVATE_LOCK_EXPLANATION = (
+    "Unverified API projects created after 28 July 2020 have all uploads forced to "
+    "private; pass the YouTube API compliance audit, or change the privacy manually "
+    "in YouTube Studio."
+)
+
+Printer = Callable[[str], None]
+
+
+@dataclass
+class VerificationResult:
+    actual_privacy: Optional[str] = None
+    privacy_mismatch: bool = False
+    recording_date_problem: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _warn(out: Printer, message: str) -> None:
+    out(message)
+    logger.warning(message)
+
+
+def verify_upload(
+    conn,
+    config: Config,
+    tracker: QuotaTracker,
+    youtube,
+    video: VideoRecord,
+    *,
+    out: Printer = print,
+) -> VerificationResult:
+    """Read back an uploaded video and store its actual privacy.
+
+    Never raises and never changes the row's status: a verification problem
+    must not undo or fail an upload that already succeeded.
+    """
+    result = VerificationResult()
+    try:
+        response = youtube.videos().list(part=VERIFY_PARTS, id=video.youtube_video_id).execute()
+        tracker.record(VERIFY_COST_UNITS)
+    except HttpError as exc:
+        result.error = _safe_error_text(parse_http_error(exc))
+    except Exception as exc:  # network etc.; verification is best effort
+        result.error = f"{type(exc).__name__}"
+    if result.error:
+        _warn(out, f"WARNING: could not verify video {video.youtube_video_id} (row {video.id}): "
+                   f"{result.error}. The upload itself succeeded.")
+        return result
+
+    items = response.get("items") if isinstance(response, dict) else None
+    if not items:
+        result.error = "video not returned by videos.list"
+        _warn(out, f"WARNING: video {video.youtube_video_id} (row {video.id}) was not returned "
+                   "by videos.list; it may still be processing. The upload itself succeeded.")
+        return result
+
+    item = items[0]
+    requested = config.youtube.privacy
+    actual = (item.get("status") or {}).get("privacyStatus")
+    result.actual_privacy = actual
+    try:
+        update_video_verification(conn, video.id, actual_privacy=actual)
+    except Exception as exc:
+        result.error = f"could not store actual_privacy: {type(exc).__name__}"
+        logger.warning("Video %s: %s", video.id, result.error)
+
+    if actual != requested:
+        result.privacy_mismatch = True
+        bar = "!" * 78
+        _warn(out, "\n".join([
+            bar,
+            "!!! PRIVATE-UPLOAD LOCK: privacy does not match what was requested",
+            f"!!! video {video.youtube_video_id} (row {video.id}): requested "
+            f"'{requested}', YouTube reports '{actual}'.",
+            "!!! This project is probably subject to the private-upload lock.",
+            f"!!! {PRIVATE_LOCK_EXPLANATION}",
+            bar,
+        ]))
+
+    expected_date = _format_recording_date(video.taken_utc)
+    actual_date = (item.get("recordingDetails") or {}).get("recordingDate")
+    if expected_date:
+        if not actual_date:
+            result.recording_date_problem = "missing"
+        else:
+            normalized = _format_recording_date(actual_date) or actual_date
+            # YouTube may keep only the date part, so compare the UTC date.
+            if normalized[:10] != expected_date[:10]:
+                result.recording_date_problem = f"differs: expected {expected_date}, got {actual_date}"
+        if result.recording_date_problem:
+            _warn(out, f"WARNING: recordingDate for video {video.youtube_video_id} (row {video.id}) "
+                       f"did not stick ({result.recording_date_problem}).")
+
+    processing = (item.get("processingDetails") or {}).get("processingStatus")
+    if processing:
+        logger.info("Video %s: processingStatus=%s", video.id, processing)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RecoverySummary:
+    resumed: int = 0
+    adopted: int = 0
+    requeued: int = 0
+    failed: int = 0
+    deferred: int = 0
+
+
+def _uploads_playlist_id(youtube, tracker: QuotaTracker) -> Optional[str]:
+    response = youtube.channels().list(part="contentDetails", mine=True).execute()
+    tracker.record(LIST_COST_UNITS)
+    items = response.get("items") or []
+    if not items:
+        return None
+    return ((items[0].get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads")
+
+
+def find_existing_upload(
+    conn,
+    config: Config,
+    tracker: QuotaTracker,
+    youtube,
+    video: VideoRecord,
+    *,
+    max_pages: int = DEFAULT_ADOPTION_MAX_PAGES,
+) -> tuple[str, Optional[str]]:
+    """Look in the channel's uploads playlist for a video this row already produced.
+
+    Uses channels.list + playlistItems.list only (never search.list). Matches
+    on the exact title that would be sent, ignoring videos already in the DB.
+
+    Returns (outcome, video_id) where outcome is one of:
+      "found" (exactly one match), "none", "ambiguous" (several matches),
+      "unavailable" (could not check: quota or API error).
+    """
+    title = build_request_body(video, config)["snippet"]["title"]
+    try:
+        if not tracker.can_afford(LIST_COST_UNITS):
+            return ("unavailable", None)
+        playlist_id = _uploads_playlist_id(youtube, tracker)
+        if not playlist_id:
+            return ("none", None)
+        matches: list[str] = []
+        page_token: Optional[str] = None
+        for _ in range(max_pages):
+            if not tracker.can_afford(LIST_COST_UNITS):
+                return ("unavailable", None)
+            kwargs: dict[str, Any] = dict(part="snippet", playlistId=playlist_id, maxResults=50)
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = youtube.playlistItems().list(**kwargs).execute()
+            tracker.record(LIST_COST_UNITS)
+            for item in response.get("items") or []:
+                snippet = item.get("snippet") or {}
+                vid = (snippet.get("resourceId") or {}).get("videoId")
+                if vid and snippet.get("title") == title and get_video_by_youtube_id(conn, vid) is None:
+                    if vid not in matches:
+                        matches.append(vid)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+    except HttpError as exc:
+        logger.warning("Video %s: uploads playlist check failed: %s",
+                       video.id, _safe_error_text(parse_http_error(exc)))
+        return ("unavailable", None)
+    except Exception as exc:
+        logger.warning("Video %s: uploads playlist check failed: %s", video.id, type(exc).__name__)
+        return ("unavailable", None)
+
+    if len(matches) == 1:
+        return ("found", matches[0])
+    if len(matches) > 1:
+        return ("ambiguous", None)
+    return ("none", None)
+
+
+def recover_stuck_uploads(
+    conn,
+    config: Config,
+    tracker: QuotaTracker,
+    youtube,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+    out: Printer = print,
+    adoption_max_pages: int = DEFAULT_ADOPTION_MAX_PAGES,
+) -> RecoverySummary:
+    """Handle rows left in UPLOADING by a crashed or killed run.
+
+    For each such row:
+      1. If a session URI was saved, try to resume it (best effort). A session
+         that had actually finished returns the video, so no duplicate.
+      2. If there is no session, or it is gone (404/410/400), look for the
+         video in the channel's uploads playlist. Exactly one title match not
+         already in the DB is adopted (UPLOADED + verification).
+      3. Otherwise the row goes back to PENDING with the session cleared, to
+         be uploaded from scratch. If several videos match, the row is marked
+         FAILED for manual review instead of risking a duplicate. If the check
+         could not run (quota / API error), the row stays UPLOADING and is
+         retried next run.
+
+    QuotaExhaustedError / UploadLimitExceededError propagate (stop the run).
+    """
+    summary = RecoverySummary()
+    stuck = get_videos_by_status(conn, VideoStatus.UPLOADING)
+    if stuck and tracker.is_exhausted():
+        summary.deferred = len(stuck)
+        out(f"{len(stuck)} interrupted upload(s) left for next run: today's quota is exhausted.")
+        return summary
+    for video in stuck:
+        out(f"Recovering interrupted upload: row {video.id} ({video.title or video.source_path})")
+
+        if video.upload_session_uri:
+            try:
+                media = MediaFileUpload(
+                    video.source_path, chunksize=config.youtube.upload_chunk_size, resumable=True
+                )
+            except OSError as exc:
+                error = f"Cannot open source file: {type(exc).__name__}: {exc.strerror or exc}"
+                transition_video_status(conn, video.id, VideoStatus.FAILED, error=error[:_MAX_ERROR_LEN],
+                                        clear_session_uri=True)
+                summary.failed += 1
+                continue
+            try:
+                result = _run_upload(
+                    conn, config, tracker, youtube, video, media,
+                    max_attempts=max_attempts, sleep=sleep,
+                    resume_uri=video.upload_session_uri,
+                )
+            except SessionGoneError as exc:
+                logger.info("Video %s: saved session unusable (%s)", video.id, exc)
+            except UploadRetriesExhaustedError:
+                summary.failed += 1
+                continue
+            else:
+                if result.status == VideoStatus.UPLOADED:
+                    summary.resumed += 1
+                    out(f"  resumed and finished: YouTube id {result.youtube_video_id}")
+                    verify_upload(conn, config, tracker, youtube, result, out=out)
+                else:
+                    summary.failed += 1
+                continue
+
+        # No usable session: before re-uploading, make sure it is not already there.
+        outcome, found_id = find_existing_upload(
+            conn, config, tracker, youtube, video, max_pages=adoption_max_pages
+        )
+        if outcome == "found":
+            adopted = transition_video_status(
+                conn, video.id, VideoStatus.UPLOADED,
+                youtube_video_id=found_id, clear_session_uri=True,
+            )
+            summary.adopted += 1
+            out(f"  already on YouTube as {found_id}; adopted instead of re-uploading")
+            verify_upload(conn, config, tracker, youtube, adopted, out=out)
+        elif outcome == "ambiguous":
+            transition_video_status(
+                conn, video.id, VideoStatus.FAILED, clear_session_uri=True,
+                error="Recovery: several uploaded videos match this title; "
+                      "resolve manually to avoid a duplicate",
+            )
+            summary.failed += 1
+            _warn(out, f"WARNING: row {video.id}: several uploaded videos match its title; "
+                       "marked FAILED for manual review.")
+        elif outcome == "unavailable":
+            summary.deferred += 1
+            _warn(out, f"WARNING: row {video.id}: could not check for an existing upload; "
+                       "leaving it UPLOADING to retry recovery next run.")
+        else:
+            transition_video_status(conn, video.id, VideoStatus.PENDING, clear_session_uri=True)
+            summary.requeued += 1
+            out("  not found on YouTube; re-queued as PENDING")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Run loop
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunSummary:
+    uploaded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    privacy_mismatches: int = 0
+    stopped_reason: Optional[str] = None
+    recovery: RecoverySummary = field(default_factory=RecoverySummary)
+
+
+def _too_long(video: VideoRecord, config: Config) -> bool:
+    return (
+        not config.youtube.channel_verified
+        and video.duration_s is not None
+        and video.duration_s > MAX_UNVERIFIED_DURATION_S
+    )
+
+
+def run_uploads(
+    conn,
+    config: Config,
+    tracker: QuotaTracker,
+    youtube,
+    *,
+    limit: Optional[int] = None,
+    wait: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+    out: Printer = print,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_sleep: Callable[[float], None] = time.sleep,
+) -> RunSummary:
+    """Recover interrupted uploads, then upload PENDING rows in (taken_utc, id) order.
+
+    ``sleep`` is used only for --wait (sleeping until the quota reset);
+    ``retry_sleep`` is the backoff sleep between chunk retries.
+    """
+    summary = RunSummary()
+    cost = config.quota.upload_cost_units
+
+    try:
+        summary.recovery = recover_stuck_uploads(
+            conn, config, tracker, youtube, max_attempts=max_attempts, sleep=retry_sleep, out=out
+        )
+    except QuotaExhaustedError:
+        summary.stopped_reason = "quota exhausted (quotaExceeded from YouTube)"
+    except UploadLimitExceededError:
+        summary.stopped_reason = "channel upload limit reached (uploadLimitExceeded)"
+    if summary.stopped_reason:
+        out(f"Stopping: {summary.stopped_reason}.")
+        return summary
+
+    attempted = 0
+    for video in get_videos_by_status(conn, VideoStatus.PENDING):
+        if limit is not None and attempted >= limit:
+            break
+
+        if _too_long(video, config):
+            minutes = video.duration_s / 60  # type: ignore[operator]
+            transition_video_status(
+                conn, video.id, VideoStatus.SKIPPED,
+                error=f"Too long for an unverified channel ({minutes:.1f} min > 15 min); "
+                      "set youtube.channel_verified: true once the channel is verified",
+            )
+            summary.skipped += 1
+            out(f"Skipped row {video.id} ({video.title}): {minutes:.1f} min exceeds 15 min")
+            continue
+
+        if not tracker.can_afford(cost, uploads=1):
+            if not wait:
+                summary.stopped_reason = "local quota budget for today is used up"
+                break
+            delay = tracker.seconds_until_reset()
+            out(f"Quota budget used up; waiting {delay:.0f}s until the Pacific-midnight reset.")
+            sleep(delay)
+            if not tracker.can_afford(cost, uploads=1):
+                summary.stopped_reason = "quota still unavailable after waiting for reset"
+                break
+
+        attempted += 1
+        out(f"Uploading row {video.id}: {video.title or video.source_path}")
+        try:
+            result = upload_one(
+                conn, config, tracker, youtube, video, max_attempts=max_attempts, sleep=retry_sleep
+            )
+        except QuotaExhaustedError:
+            summary.stopped_reason = "quota exhausted (quotaExceeded from YouTube)"
+            break
+        except UploadLimitExceededError:
+            summary.stopped_reason = "channel upload limit reached (uploadLimitExceeded)"
+            break
+        except UploadRetriesExhaustedError as exc:
+            summary.failed += 1
+            out(f"  FAILED: {exc}")
+            continue
+        except Exception as exc:  # one bad video must not abort the run
+            summary.failed += 1
+            text = _safe_error_text(parse_http_error(exc)) if isinstance(exc, HttpError) \
+                else type(exc).__name__
+            logger.exception("Video %s: unexpected error during upload", video.id)
+            out(f"  FAILED (unexpected {text}); row will be recovered next run if left UPLOADING")
+            continue
+
+        if result.status == VideoStatus.UPLOADED:
+            summary.uploaded += 1
+            out(f"  uploaded: https://youtu.be/{result.youtube_video_id}")
+            check = verify_upload(conn, config, tracker, youtube, result, out=out)
+            if check.privacy_mismatch:
+                summary.privacy_mismatches += 1
+        else:
+            summary.failed += 1
+            out(f"  FAILED: {result.last_error}")
+
+    if summary.stopped_reason:
+        out(f"Stopping: {summary.stopped_reason}.")
+    out(f"Done: {summary.uploaded} uploaded, {summary.failed} failed, {summary.skipped} skipped.")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Dry run
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DryRunPlan:
+    to_upload: list[VideoRecord] = field(default_factory=list)
+    to_skip: list[VideoRecord] = field(default_factory=list)
+    interrupted: int = 0
+    estimated_units: int = 0
+    database_missing: bool = False
+
+
+def dry_run(config: Config, *, limit: Optional[int] = None, out: Printer = print) -> DryRunPlan:
+    """Print what an upload run would do. Touches neither the API nor the database
+    (opens it read-only; never creates a missing database file)."""
+    plan = DryRunPlan()
+    db_path = config.paths.db_path
+    try:
+        conn = get_readonly_connection(db_path)
+    except FileNotFoundError:
+        plan.database_missing = True
+        out(f"[DRY RUN] No database at {db_path}; nothing to upload (run 'photos2yt ingest' first).")
+        return plan
+
+    try:
+        plan.interrupted = len(get_videos_by_status(conn, VideoStatus.UPLOADING))
+        for video in get_videos_by_status(conn, VideoStatus.PENDING):
+            if _too_long(video, config):
+                plan.to_skip.append(video)
+                continue
+            if limit is not None and len(plan.to_upload) >= limit:
+                continue
+            plan.to_upload.append(video)
+    finally:
+        conn.close()
+
+    per_video = config.quota.upload_cost_units + VERIFY_COST_UNITS
+    plan.estimated_units = per_video * len(plan.to_upload)
+
+    out(f"[DRY RUN] Would upload {len(plan.to_upload)} video(s), requested privacy "
+        f"'{config.youtube.privacy}'.")
+    for video in plan.to_upload:
+        title = build_request_body(video, config)["snippet"]["title"]
+        out(f"  - row {video.id}: {title}")
+    for video in plan.to_skip:
+        out(f"  - would SKIP row {video.id} ({video.title}): longer than 15 min, channel not verified")
+    if plan.interrupted:
+        out(f"  {plan.interrupted} interrupted upload(s) would be recovered first "
+            "(may use a few extra units).")
+    out(f"  Estimated quota: {plan.estimated_units} units "
+        f"({config.quota.upload_cost_units} per upload + {VERIFY_COST_UNITS} per verification); "
+        f"daily limit {config.quota.daily_unit_limit}.")
+    return plan

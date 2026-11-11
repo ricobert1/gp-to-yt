@@ -7,7 +7,13 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from photos2yt.auth import AuthError, authenticate, check_authorization
+from photos2yt.auth import (
+    AuthError,
+    authenticate,
+    check_authorization,
+    get_credentials,
+    get_youtube_service,
+)
 from photos2yt.config import ConfigError, load_config
 from photos2yt.takeout import TakeoutError, ingest
 
@@ -66,6 +72,53 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_upload_command(
+    config,
+    *,
+    limit: Optional[int] = None,
+    dry_run: bool = False,
+    wait: bool = False,
+    youtube=None,
+    sleep=None,
+) -> int:
+    """Implements `photos2yt upload`. Returns the process exit code.
+
+    --dry-run: read-only, no credentials, no API client, no DB writes.
+    Otherwise credentials come from auth.get_credentials() (never a browser
+    flow). Exit code 1 if any video failed, else 0 (a clean stop on quota or
+    the channel upload limit is not a failure).
+    """
+    import time
+
+    from photos2yt.db import get_connection, init_db
+    from photos2yt.quota import QuotaTracker
+    from photos2yt.uploader import dry_run as upload_dry_run
+    from photos2yt.uploader import run_uploads
+
+    if limit is not None and limit < 0:
+        sys.stderr.write("--limit must be zero or positive\n")
+        return 2
+
+    if dry_run:
+        upload_dry_run(config, limit=limit)
+        return 0
+
+    if youtube is None:
+        creds = get_credentials(config=config)
+        youtube = get_youtube_service(config=config, credentials=creds)
+
+    conn = init_db(get_connection(config.paths.db_path))
+    try:
+        tracker = QuotaTracker(conn, config)
+        summary = run_uploads(
+            conn, config, tracker, youtube,
+            limit=limit, wait=wait, sleep=sleep or time.sleep,
+        )
+    finally:
+        conn.close()
+    return 1 if summary.failed else 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv)
@@ -109,6 +162,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if summary.report_path:
                 print(f"  CSV report written to:   {summary.report_path}")
             return 0
+
+        if args.subcommand == "upload":
+            return run_upload_command(config, limit=args.limit, dry_run=args.dry_run, wait=args.wait)
 
         print(f"Command '{args.subcommand}' not yet implemented. Configuration loaded successfully.")
         return 0

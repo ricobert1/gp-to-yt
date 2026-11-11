@@ -38,6 +38,7 @@ class YouTubeConfig:
     title_template: str
     default_title: str
     upload_chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE
+    channel_verified: bool = False  # verified channels may upload videos > 15 min
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,12 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
                 f"got {repr(chunk_size)}"
             )
 
+        channel_verified = yt_data.get("channel_verified", False)
+        if not isinstance(channel_verified, bool):
+            errors.append(
+                f"youtube.channel_verified must be a boolean (true/false), got {repr(channel_verified)}"
+            )
+
         if yt_data and all(k in yt_data for k in ("privacy", "category_id", "made_for_kids", "title_template", "default_title")):
             if privacy in VALID_PRIVACY_VALUES and isinstance(made_for_kids, bool):
                 yt_obj = YouTubeConfig(
@@ -162,6 +169,7 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
                     title_template=str(title_tpl),
                     default_title=str(default_title),
                     upload_chunk_size=chunk_size if chunk_ok else DEFAULT_UPLOAD_CHUNK_SIZE,
+                    channel_verified=channel_verified if isinstance(channel_verified, bool) else False,
                 )
 
     # 4. Validate 'quota'

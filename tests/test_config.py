@@ -292,3 +292,14 @@ def test_upload_chunk_size_custom_value():
 def test_upload_chunk_size_invalid(bad):
     with pytest.raises(ConfigError, match="youtube.upload_chunk_size"):
         validate_and_parse_config(_raw_with_youtube(upload_chunk_size=bad))
+
+
+def test_channel_verified_defaults_false_and_parses():
+    assert validate_and_parse_config(_raw_with_youtube()).youtube.channel_verified is False
+    cfg = validate_and_parse_config(_raw_with_youtube(channel_verified=True))
+    assert cfg.youtube.channel_verified is True
+
+
+def test_channel_verified_must_be_bool():
+    with pytest.raises(ConfigError, match="youtube.channel_verified"):
+        validate_and_parse_config(_raw_with_youtube(channel_verified="yes"))
