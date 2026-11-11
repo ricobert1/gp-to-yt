@@ -14,14 +14,24 @@
 - Task 6 part 2: post-upload verification, crash recovery, `photos2yt upload` run loop and
   read-only dry run. Awaiting human review. Not yet tested against the real API: the
   task's manual acceptance step ("upload one real short file") is still to do.
+  Update 2026-11-11: done by the human, see "Real-API checks" below.
 - Task 7B: curator real run (`photos2yt curate`), plus curate --dry-run read-only fix and
-  rules path from config/CLI. Awaiting human review. Not yet run against the real API.
+  rules path from config/CLI. Awaiting human review of the diff. Checked against the real
+  API (see below).
+
+## Real-API checks (2026-11-11, by the human)
+- `upload --limit 1`: one short video uploaded, exit 0. Requested `unlisted`; no
+  PRIVATE-UPLOAD LOCK banner and no recordingDate warning were printed, so this project
+  does not appear to be forced to private.
+- `curate --dry-run` with a one-rule rules.yaml (private test playlist, single local
+  date): plan was correct (1 playlist, 1 add at position 0, 100 units); queue.db hash
+  unchanged; no new files.
+- `curate`: playlist created and stored, video added at position 0, membership added=1,
+  row PLAYLISTED, quota counter +100. Playlist and video visible in Studio.
+- `curate` re-run: no API calls, quota counter unchanged.
 
 ## Next
-- Manual: upload one real short file (`photos2yt upload --limit 1`), check the
-  private-lock warning and recordingDate check against reality.
-- Manual: after the first real upload, `photos2yt curate --dry-run`, then `photos2yt curate`
-  with a one-rule rules.yaml; check the playlist order in Studio.
+- Manual (optional): curate a rule matching 2-3 videos and check the order in Studio.
 - Task 8 (not started).
 
 ## How the curator behaves (Task 7)
@@ -146,8 +156,8 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
 ## Open questions
 - recordingDetails.location may be deprecated by the API; kept because the spec requires it.
 - Confirm current videos.insert quota cost against Google's table before first real upload.
-- Whether the API project is subject to the private-upload lock (the first real upload will
-  show it: watch for the PRIVATE-UPLOAD LOCK banner).
+- Private-upload lock: first real upload kept `unlisted` (no banner). Confirm in Studio
+  over the next few uploads.
 - Is 4 pages (200 newest uploads) the right adoption search depth? It costs up to 5 units
   per stuck row.
 - Curator: should a playlist deleted on YouTube be re-created automatically? Currently it
