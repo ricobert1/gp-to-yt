@@ -303,3 +303,15 @@ def test_channel_verified_defaults_false_and_parses():
 def test_channel_verified_must_be_bool():
     with pytest.raises(ConfigError, match="youtube.channel_verified"):
         validate_and_parse_config(_raw_with_youtube(channel_verified="yes"))
+
+
+def test_upload_order_defaults_to_largest_first_and_parses():
+    assert validate_and_parse_config(_raw_with_youtube()).youtube.upload_order == "largest_first"
+    cfg = validate_and_parse_config(_raw_with_youtube(upload_order="oldest_first"))
+    assert cfg.youtube.upload_order == "oldest_first"
+
+
+@pytest.mark.parametrize("bad", ["biggest", "", None, 1])
+def test_upload_order_invalid(bad):
+    with pytest.raises(ConfigError, match="upload_order"):
+        validate_and_parse_config(_raw_with_youtube(upload_order=bad))

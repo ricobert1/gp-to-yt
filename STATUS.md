@@ -246,6 +246,12 @@
   read-only.
 
 ## How the uploader behaves (Task 6)
+- Upload order (2026-11-11, human request): new optional config key `youtube.upload_order`,
+  `largest_first` (default) or `oldest_first`. largest_first = PENDING rows by size_bytes
+  descending, ties by (taken_utc, id); oldest_first = the old (taken_utc, id). The dry run
+  lists rows in the same order with their size in MB. Curate is unaffected: playlist
+  positions come from recording dates, not upload order. Videos > 15 min on an unverified
+  channel are still skipped without using a --limit slot (large files are often long ones).
 - Run order: recover rows stuck in UPLOADING, then upload PENDING rows by (taken_utc, id).
 - Before each upload: `can_afford(upload_cost_units, uploads=1)`. If not: stop, or with
   `--wait` sleep until `seconds_until_reset()` once and re-check (stop if still unaffordable).
@@ -346,6 +352,10 @@ uploads exist) will be uploaded again. Running recovery soon after a crash keeps
   over the next few uploads.
 - Is 4 pages (200 newest uploads) the right adoption search depth? It costs up to 5 units
   per stuck row.
+- Deleting originals automatically: not possible for Google Photos (the Photos Library API
+  has no delete call, and since March 2025 it can only see media the app itself created).
+  Deleting the local Takeout copies would need the ground rule "never delete or modify source
+  files" (AGENT_RULES section 0) changed by the human; not done.
 - Docker: should a missing `paths.rules` file from config be treated like the default (print
   "nothing to curate", exit 0) instead of an error, so a nightly run without playlists is
   green? Currently documented instead of changed.

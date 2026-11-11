@@ -16,6 +16,7 @@ class ConfigError(Exception):
 
 
 VALID_PRIVACY_VALUES = {"private", "unlisted", "public"}
+VALID_UPLOAD_ORDERS = ("largest_first", "oldest_first")
 
 # Resumable upload chunks must be a multiple of 256 KiB (YouTube/Google API rule).
 UPLOAD_CHUNK_ALIGNMENT = 256 * 1024
@@ -42,6 +43,7 @@ class YouTubeConfig:
     default_title: str
     upload_chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE
     channel_verified: bool = False  # verified channels may upload videos > 15 min
+    upload_order: str = "largest_first"  # or "oldest_first"
 
 
 @dataclass(frozen=True)
@@ -168,6 +170,13 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
                 f"youtube.channel_verified must be a boolean (true/false), got {repr(channel_verified)}"
             )
 
+        upload_order = yt_data.get("upload_order", "largest_first")
+        if upload_order not in VALID_UPLOAD_ORDERS:
+            errors.append(
+                f"youtube.upload_order must be one of {', '.join(VALID_UPLOAD_ORDERS)}, "
+                f"got {repr(upload_order)}"
+            )
+
         if yt_data and all(k in yt_data for k in ("privacy", "category_id", "made_for_kids", "title_template", "default_title")):
             if privacy in VALID_PRIVACY_VALUES and isinstance(made_for_kids, bool):
                 yt_obj = YouTubeConfig(
@@ -178,6 +187,7 @@ def validate_and_parse_config(raw: Any, base_dir: Optional[Path] = None, config_
                     default_title=str(default_title),
                     upload_chunk_size=chunk_size if chunk_ok else DEFAULT_UPLOAD_CHUNK_SIZE,
                     channel_verified=channel_verified if isinstance(channel_verified, bool) else False,
+                    upload_order=upload_order if upload_order in VALID_UPLOAD_ORDERS else "largest_first",
                 )
 
     # 4. Validate 'quota'

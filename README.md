@@ -87,6 +87,7 @@ file. The important keys:
 | `paths.rules` | Playlist rules for `curate`. If this key is set the file must exist (see below). |
 | `timezone` | Your local time zone; decides local dates for titles and playlist rules. |
 | `youtube.privacy` | Requested privacy (`private`, `unlisted`, `public`). See section 7. |
+| `youtube.upload_order` | `largest_first` (default: biggest files first, frees the most Google Photos storage soonest) or `oldest_first`. Playlists are ordered by date either way. |
 | `youtube.title_template` | Title format; `{title}` is the Google Photos caption, else a meaningful file name. |
 | `quota.*` | Daily unit limit and per-call costs. |
 

@@ -472,13 +472,18 @@ def get_videos_by_status(
     status: VideoStatus | str,
     *,
     limit: Optional[int] = None,
+    largest_first: bool = False,
 ) -> list[VideoRecord]:
-    """Retrieve videos with a specific status, ordered by taken_utc ascending (nulls last)."""
+    """Retrieve videos with a specific status, ordered by taken_utc ascending (nulls last).
+
+    With ``largest_first`` the order is size_bytes descending, then the date order.
+    """
     status_str = VideoStatus(status).value
-    query = """
+    size_order = "size_bytes DESC, " if largest_first else ""
+    query = f"""
         SELECT * FROM videos
         WHERE status = ?
-        ORDER BY (taken_utc IS NULL), taken_utc ASC, id ASC
+        ORDER BY {size_order}(taken_utc IS NULL), taken_utc ASC, id ASC
     """
     params: list[Any] = [status_str]
     if limit is not None:
