@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from photos2yt import ECHOED_TO_TERMINAL
 from photos2yt.auth import (
     AuthError,
     authenticate,
@@ -119,7 +121,44 @@ def run_upload_command(
     return 1 if summary.failed else 0
 
 
+class _StderrHandler(logging.StreamHandler):
+    """Writes to whatever sys.stderr is at emit time (works with redirection)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @property
+    def stream(self):  # type: ignore[override]
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, _value) -> None:
+        pass
+
+
+def _not_echoed(record: logging.LogRecord) -> bool:
+    return not getattr(record, ECHOED_TO_TERMINAL, False)
+
+
+def configure_logging() -> None:
+    """Show photos2yt WARNING+ log records on stderr, once.
+
+    Records whose message was already printed to stdout (marked with
+    ECHOED_TO_TERMINAL) are skipped so each warning appears once on the
+    terminal. Idempotent: calling main() repeatedly adds no extra handler.
+    """
+    pkg_logger = logging.getLogger("photos2yt")
+    if any(isinstance(h, _StderrHandler) for h in pkg_logger.handlers):
+        return
+    handler = _StderrHandler()
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    handler.addFilter(_not_echoed)
+    pkg_logger.addHandler(handler)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    configure_logging()
     parser = create_parser()
     args = parser.parse_args(argv)
 
