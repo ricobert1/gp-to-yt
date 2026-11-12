@@ -3,6 +3,7 @@
 ## 0. Ground Rules
 
 - **Done means:** the task's tests pass AND the human has reviewed the diff. Do not mark a task complete before both.
+- **Static check gate:** before reporting a task done, run `uvx ruff check --select F821,F811 photos2yt tests`; it must report no errors. Undefined names and redefinitions are real bugs. Do not skip, silence or `# noqa` them. Never leave imports of spec-required pieces unused.
 - Python 3.10+, package `photos2yt/`, CLI via `typer` or `argparse`, tests with `pytest`.
 - Dependencies: `google-api-python-client`, `google-auth-oauthlib`, `google-auth-httplib2`, `tenacity`, `pyyaml`, `pytest`. External binary: `ffprobe` (from ffmpeg). Standard library `sqlite3`.
 - All tunables live in `config.yaml` (see Task 1). No hardcoded quota numbers, time zones, paths, or title templates.
