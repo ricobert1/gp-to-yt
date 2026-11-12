@@ -127,6 +127,11 @@
   (time, action, row, video id, source, destination). Exit 1 if any file failed.
 - Not part of the nightly job. In Docker the staging mount is read-only, so cleanup is for
   native runs.
+- Real run (2026-11-12, by the human, on the Mac): after updating, `reconcile` confirmed all 7
+  uploaded videos (setting verified_at); `cleanup --dry-run` listed those 7 (0.40 GB, 7
+  sidecars) and nothing else; `cleanup` moved them to ~/gp-to-yt-staging-uploaded
+  successfully. Lesson from the run: a reconcile done with the pre-migration-4 code does not
+  set verified_at, so after upgrading run reconcile again before cleanup.
 
 ## How reconcile behaves (Task 8)
 - Checks rows in status UPLOADED **and PLAYLISTED** that have a youtube_video_id. PLAYLISTED
