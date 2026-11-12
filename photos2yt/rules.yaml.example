@@ -14,6 +14,7 @@
 #   - local_year: integer year
 #   - title_contains_any: list of keywords (case-insensitive whole-word match)
 #   - tags_contain_any: list of keyword tags (case-insensitive whole-word match)
+#   - every_video: true  (matches every video; for an "all videos" playlist)
 #
 # Example:
 #   playlists:

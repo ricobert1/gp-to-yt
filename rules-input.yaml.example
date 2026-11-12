@@ -10,6 +10,10 @@ privacy: unlisted                 # private, unlisted or public (playlists only)
 
 years: [2012, 2026]               # first and last year your videos cover
 
+# One playlist holding every video (alongside its other playlists).
+# Remove the line (or set null) for none.
+all_playlist: "All Family Videos"
+
 # One playlist per year. Remove the line (or set null) for none.
 year_playlist: "Family Videos {year}"
 

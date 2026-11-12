@@ -77,7 +77,8 @@ Printer = Callable[[str], None]
 
 VALID_PRIVACY = ("private", "unlisted", "public")
 CONDITION_FIELDS = frozenset(
-    {"local_month", "local_day", "local_year", "title_contains_any", "tags_contain_any"}
+    {"local_month", "local_day", "local_year", "title_contains_any", "tags_contain_any",
+     "every_video"}
 )
 _INT_RANGES = {"local_month": (1, 12), "local_day": (1, 31), "local_year": (1800, 9999)}
 MAX_PLAYLIST_TITLE = 150  # YouTube playlist title limit
@@ -158,6 +159,9 @@ def _validate_condition(name: str, where: str, j: int, cond: Any) -> None:
                 raise RulesError(
                     f"{label} has invalid '{key}'={val!r}; must be an integer between {lo} and {hi}"
                 )
+    if "every_video" in cond and cond["every_video"] is not True:
+        raise RulesError(f"{label} has invalid 'every_video'={cond['every_video']!r}; "
+                         "it can only be true")
     for key in ("title_contains_any", "tags_contain_any"):
         if key in cond:
             words = cond[key]
@@ -285,7 +289,8 @@ def _local_date_parts(video: VideoRecord) -> Optional[tuple[int, int, int]]:
 
 
 def _condition_holds(cond: dict[str, Any], video: VideoRecord) -> bool:
-    """Every field in the condition must hold."""
+    """Every field in the condition must hold. ``every_video: true`` adds no
+    restriction, so on its own it matches every video (even one with no date)."""
     if any(k in cond for k in _INT_RANGES):
         parts = _local_date_parts(video)
         if parts is None:

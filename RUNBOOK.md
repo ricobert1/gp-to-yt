@@ -48,8 +48,8 @@ uv run photos2yt -c config.yaml make-rules --force
 uv run photos2yt -c config.yaml curate --dry-run
 ```
 `--force` replaces the existing `rules.yaml` (edit `rules-input.yaml`, not
-`rules.yaml`). A video can be in several playlists (its year, a holiday, a
-birthday, a trip); each playlist stays in date order. Each playlist add costs
+`rules.yaml`). A video can be in several playlists ("All Family Videos" if
+`all_playlist` is set, its year, a holiday, a birthday, a trip); each playlist stays in date order. Each playlist add costs
 50 quota units, so after a big upload night curate may stop on quota and finish
 the next night; that is normal.
 

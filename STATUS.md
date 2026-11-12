@@ -206,6 +206,11 @@
   keyword playlists on captions. Output is written via a temp file, validated with
   curator.load_rules, and never overwrites without --force. Uses only existing condition
   fields, so curate itself is unchanged. Holidays are US ones; add more in HOLIDAYS.
+- "All videos" playlist (2026-11-12, human request): new rule condition `every_video: true`
+  (validated: only `true` allowed) adds no restriction, so a condition with only that field
+  matches every video, including ones with no local date. make-rules writes it from the
+  optional `all_playlist: "<name>"` input key, as the first playlist. Costs one more playlist
+  add (50 units) per video.
 - Rules file: `curate --rules PATH`, else `paths.rules` in config.yaml (new optional key,
   resolved relative to the config file), else `rules.yaml` next to the config file. An
   explicitly given file that is missing is an error (exit 1); a missing default file just
