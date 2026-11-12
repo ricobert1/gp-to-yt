@@ -104,6 +104,20 @@ def create_parser() -> argparse.ArgumentParser:
                                 help="Only files whose video reconcile confirmed within this many "
                                      "days (default 7)")
 
+    # make-rules: build rules.yaml from a short input file
+    mr_parser = subparsers.add_parser(
+        "make-rules",
+        help="Build rules.yaml (year, holiday, birthday, trip, keyword playlists) from rules-input.yaml",
+    )
+    mr_parser.add_argument("--input", default=None,
+                           help="Input file (default: rules-input.yaml next to the config file)")
+    mr_parser.add_argument("--output", default=None,
+                           help="Rules file to write (default: paths.rules, else rules.yaml "
+                                "next to the config file)")
+    mr_parser.add_argument("--force", action="store_true", help="Replace an existing rules file")
+    mr_parser.add_argument("--dry-run", action="store_true",
+                           help="List the playlists that would be written; writes nothing")
+
     # report command (Task 8)
     report_parser = subparsers.add_parser(
         "report", help="Write manifest.csv and summary.txt from the database (no API calls)"
@@ -481,6 +495,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return run_cleanup_command(
                 config, dry_run=args.dry_run, dest=args.dest, delete=args.delete,
                 yes=args.yes, max_age_days=args.max_age_days,
+            )
+
+        if args.subcommand == "make-rules":
+            from photos2yt.rulegen import default_paths, make_rules_file
+            default_in, default_out = default_paths(config)
+            return make_rules_file(
+                Path(args.input) if args.input else default_in,
+                Path(args.output) if args.output else default_out,
+                force=args.force, dry_run=args.dry_run,
             )
 
         if args.subcommand == "report":

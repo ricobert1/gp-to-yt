@@ -196,6 +196,16 @@
 - Run `reconcile` first for fresh privacy / missing information; report does not call the API.
 
 ## How the curator behaves (Task 7)
+- Rules generator (2026-11-12, human request: no Google Photos albums to reuse, so playlists are
+  built from dates): `photos2yt make-rules [--dry-run] [--force] [--input] [--output]`
+  (photos2yt/rulegen.py) expands rules-input.yaml (gitignored; example
+  rules-input.yaml.example) into rules.yaml: one playlist per year; holidays (fixed dates as
+  month/day; moving ones - Easter, Mother's/Father's Day, Memorial/Labor Day, Thanksgiving -
+  as exact dates for every year in `years`); one playlist per birthday (month/day, optional
+  window_days either side, year-independent, Feb 29 handled); trips as every day start..end;
+  keyword playlists on captions. Output is written via a temp file, validated with
+  curator.load_rules, and never overwrites without --force. Uses only existing condition
+  fields, so curate itself is unchanged. Holidays are US ones; add more in HOLIDAYS.
 - Rules file: `curate --rules PATH`, else `paths.rules` in config.yaml (new optional key,
   resolved relative to the config file), else `rules.yaml` next to the config file. An
   explicitly given file that is missing is an error (exit 1); a missing default file just

@@ -95,8 +95,13 @@ file. The important keys:
 | `youtube.title_template` | Title format; `{title}` is the Google Photos caption, else a meaningful file name. |
 | `quota.*` | Daily unit limit and per-call costs. |
 
-Playlist rules: copy `photos2yt/rules.yaml.example` to `rules.yaml` next to
-`config.yaml` and edit it. If you do not want playlists yet, either create a
+Playlist rules: the easy way is `make-rules`. Copy `rules-input.yaml.example`
+to `rules-input.yaml` next to `config.yaml`, fill in your years, holidays,
+birthdays and trips, and run `photos2yt make-rules`. It writes a validated
+`rules.yaml` (moving holidays such as Thanksgiving and Easter are worked out for
+every year; trips become every day from start to end). Check the result with
+`photos2yt curate --dry-run`. To write rules by hand instead, copy
+`photos2yt/rules.yaml.example` to `rules.yaml` next to `config.yaml` and edit it. If you do not want playlists yet, either create a
 `rules.yaml` containing just `playlists: []`, or delete the `rules:` line from
 `config.yaml`. Otherwise `curate` (and so the nightly job) exits with an error
 because the configured file is missing.
@@ -110,6 +115,8 @@ photos2yt [-c config.yaml] <command>
   ingest [--dry-run]          queue new videos from staging_dir; writes ingest_report.csv
   upload [--limit N] [--dry-run] [--wait]
   curate [--dry-run] [--rules PATH]
+  make-rules [--dry-run] [--force] [--input F] [--output F]
+                              build rules.yaml from rules-input.yaml (years, holidays, birthdays, trips)
   retitle [--dry-run]         rebuild titles of videos not uploaded yet
   reconcile [--dry-run]       videos.list check of every uploaded video (1 unit per 50)
   report [--out-dir DIR]      manifest.csv + summary.txt (no API calls)

@@ -32,6 +32,27 @@ There is no API to download from Google Photos; this step is manual.
 Files already handled are never uploaded twice: re-downloaded copies are
 recognised by content and marked as duplicates.
 
+## 1b. Playlists (once, and whenever you add a person, trip or year)
+
+Playlists come from `rules.yaml`, built from `rules-input.yaml`:
+```bash
+cp rules-input.yaml.example rules-input.yaml     # first time only; then edit it
+```
+```bash
+uv run photos2yt -c config.yaml make-rules --dry-run
+```
+```bash
+uv run photos2yt -c config.yaml make-rules --force
+```
+```bash
+uv run photos2yt -c config.yaml curate --dry-run
+```
+`--force` replaces the existing `rules.yaml` (edit `rules-input.yaml`, not
+`rules.yaml`). A video can be in several playlists (its year, a holiday, a
+birthday, a trip); each playlist stays in date order. Each playlist add costs
+50 quota units, so after a big upload night curate may stop on quota and finish
+the next night; that is normal.
+
 ## 2. Upload and organise (automatic, nightly)
 
 At 03:30 the job runs `ingest` -> `upload --limit N` (largest first) ->
