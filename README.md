@@ -12,6 +12,8 @@ sort them into playlists by date and keywords.
 - **report** writes `manifest.csv` (file → video id → URL → privacy → playlists)
   and `summary.txt`.
 
+Day-to-day steps are in [RUNBOOK.md](RUNBOOK.md).
+
 The local database is the source of truth. The tool keeps its own quota counter
 (there is no API for remaining quota) and never uses `search.list`. Every
 command that changes something has `--dry-run`.
