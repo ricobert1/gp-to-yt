@@ -50,3 +50,4 @@ docker-data/
 logs/
 cleanup_log.csv
 rules-input.yaml
+unpack_log.csv
