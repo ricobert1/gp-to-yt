@@ -49,3 +49,4 @@ docker-data/
 .env
 logs/
 cleanup_log.csv
+rules-input.yaml

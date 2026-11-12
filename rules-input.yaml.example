@@ -1,0 +1,37 @@
+# Input for `photos2yt make-rules`. Copy to rules-input.yaml (next to
+# config.yaml), edit, then run:
+#   uv run photos2yt -c config.yaml make-rules --dry-run
+#   uv run photos2yt -c config.yaml make-rules          # writes rules.yaml
+#   uv run photos2yt -c config.yaml curate --dry-run    # see where videos go
+# All dates are local dates (config.yaml timezone). A video can be in several
+# playlists; each playlist is kept in date order.
+
+privacy: unlisted                 # private, unlisted or public (playlists only)
+
+years: [2012, 2026]               # first and last year your videos cover
+
+# One playlist per year. Remove the line (or set null) for none.
+year_playlist: "Family Videos {year}"
+
+# Holidays across all years. Choose from:
+#   new_years (Dec 31 + Jan 1), valentines, st_patricks, easter, mothers_day,
+#   memorial_day, fathers_day, july_4th, labor_day, halloween, thanksgiving,
+#   christmas (Dec 24 + 25)
+# Moving holidays (Easter, Thanksgiving, ...) are worked out for every year above.
+holiday_playlist: "{holiday} Through the Years"
+holidays: [new_years, easter, mothers_day, fathers_day, july_4th, halloween, thanksgiving, christmas]
+
+# One playlist per person, every year on that date. window_days also catches
+# parties a few days before/after (0 = the day only). playlist: optional title.
+birthdays:
+  - {name: Emma, month: 3, day: 14, window_days: 2}
+  # - {name: Dad, month: 7, day: 2, window_days: 3, playlist: "Dad's Birthdays"}
+
+# Trips and events: every day from start to end (inclusive).
+trips:
+  - {name: "Maine Trip 2021", start: 2021-07-10, end: 2021-07-17}
+  # - {name: "Wedding", start: 2019-06-22, end: 2019-06-22}
+
+# Words in the Google Photos caption (needs Takeout .json sidecars).
+keywords: []
+  # - {name: "Soccer", words: [soccer]}
