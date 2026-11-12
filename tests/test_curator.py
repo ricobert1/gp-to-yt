@@ -844,3 +844,26 @@ def test_format_plan_without_rules_says_no_rules(conn, config):
     text = format_plan(build_plan(conn, {}, config=config), config)
     assert "no playlist rules are configured" in text
     assert "every matching video" not in text
+
+
+def test_every_video_condition_validates_and_matches(tmp_path):
+    rules = load_rules(write_rules(tmp_path, """\
+playlists:
+  - name: "All"
+    privacy: unlisted
+    match:
+      any:
+        - {every_video: true}
+"""))
+    assert _match_rule(rules["All"], _video(taken_local_date=None)) is not None
+    assert _match_rule(rules["All"], _video(taken_local_date="2001-02-03")) is not None
+    bad = write_rules(tmp_path, """\
+playlists:
+  - name: "All"
+    privacy: unlisted
+    match:
+      any:
+        - {every_video: false}
+""", name="bad.yaml")
+    with pytest.raises(RulesError, match="every_video"):
+        load_rules(bad)

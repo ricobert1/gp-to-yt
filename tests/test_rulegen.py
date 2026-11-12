@@ -174,3 +174,16 @@ def test_cli_parser():
     from photos2yt import cli
     args = cli.create_parser().parse_args(["make-rules", "--dry-run", "--force"])
     assert args.subcommand == "make-rules" and args.dry_run and args.force
+
+
+def test_all_playlist_matches_every_video_even_without_a_date():
+    rules = rules_for({**BASE, "all_playlist": "All Family Videos"})
+    assert list(rules)[0] == "All Family Videos"
+    for d in ("2019-06-01", "1999-01-01", None):
+        assert _match_rule(rules["All Family Videos"], video(d)) is not None
+    # still in its year playlist too
+    assert matches(rules, "Family Videos 2019", "2019-06-01")
+
+
+def test_no_all_playlist_by_default():
+    assert "All Family Videos" not in rules_for(BASE)

@@ -6,6 +6,7 @@ and keywords. Writing year playlists, moving holidays (Thanksgiving, Easter,
 
     privacy: unlisted
     years: [2012, 2026]                       # first and last year, inclusive
+    all_playlist: "All Family Videos"         # every video; omit for none
     year_playlist: "Family Videos {year}"     # omit or null for no year playlists
     holiday_playlist: "{holiday} Through the Years"
     holidays: [christmas, thanksgiving, halloween, july_4th, easter]
@@ -136,7 +137,7 @@ def build_rules(spec: dict) -> dict:
     """Expand the input mapping into a rules.yaml mapping ({'playlists': [...]})."""
     if not isinstance(spec, dict):
         raise RulesInputError("The input file must be a mapping (key: value lines)")
-    known = {"privacy", "years", "year_playlist", "holiday_playlist", "holidays",
+    known = {"privacy", "years", "all_playlist", "year_playlist", "holiday_playlist", "holidays",
              "birthdays", "trips", "keywords"}
     unknown = sorted(set(spec) - known)
     if unknown:
@@ -158,6 +159,10 @@ def build_rules(spec: dict) -> dict:
 
     def add(name: str, conditions: list[dict]) -> None:
         playlists.append({"name": name, "privacy": privacy, "match": {"any": conditions}})
+
+    all_name = spec.get("all_playlist")
+    if all_name:
+        add(_name(all_name, "all_playlist"), [{"every_video": True}])
 
     year_tpl = spec.get("year_playlist", "Family Videos {year}")
     if year_tpl:
