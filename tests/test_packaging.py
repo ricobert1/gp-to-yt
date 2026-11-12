@@ -42,7 +42,7 @@ def run_nightly(tmp_path: Path, codes: dict[str, int] | None = None, **env: str)
 def test_all_steps_succeed(tmp_path):
     code, calls, _ = run_nightly(tmp_path)
     assert code == 0
-    assert calls == ["ingest", "upload --limit 5", "curate", "report"]
+    assert calls == ["unpack", "ingest", "upload --limit 5", "curate", "report"]
 
 
 def test_upload_limit_from_env(tmp_path):
@@ -53,14 +53,14 @@ def test_upload_limit_from_env(tmp_path):
 def test_ingest_failure_stops_the_run(tmp_path):
     code, calls, out = run_nightly(tmp_path, {"ingest": 1})
     assert code == 1
-    assert calls == ["ingest"]
+    assert calls == ["unpack", "ingest"]
     assert "not uploading" in out
 
 
 def test_upload_failure_still_curates_and_reports_but_exits_1(tmp_path):
     code, calls, out = run_nightly(tmp_path, {"upload": 1})
     assert code == 1
-    assert calls == ["ingest", "upload --limit 5", "curate", "report"]
+    assert calls == ["unpack", "ingest", "upload --limit 5", "curate", "report"]
     assert "FAILED (exit 1): photos2yt upload" in out
 
 
@@ -71,7 +71,24 @@ def test_curate_failure_exits_1(tmp_path):
 
 def test_reconcile_optional(tmp_path):
     _, calls, _ = run_nightly(tmp_path, RECONCILE="1")
-    assert calls == ["ingest", "upload --limit 5", "curate", "reconcile", "report"]
+    assert calls == ["unpack", "ingest", "upload --limit 5", "curate", "reconcile", "report"]
+
+
+def test_cleanup_optional_after_reconcile(tmp_path):
+    _, calls, _ = run_nightly(tmp_path, RECONCILE="1", CLEANUP="1")
+    assert calls == ["unpack", "ingest", "upload --limit 5", "curate", "reconcile", "cleanup",
+                     "report"]
+
+
+def test_unpack_failure_continues_but_exits_1(tmp_path):
+    code, calls, out = run_nightly(tmp_path, {"unpack": 1})
+    assert code == 1
+    assert calls == ["unpack", "ingest", "upload --limit 5", "curate", "report"]
+
+
+def test_unpack_can_be_switched_off(tmp_path):
+    _, calls, _ = run_nightly(tmp_path, UNPACK="0")
+    assert calls[0] == "ingest"
 
 
 def test_dockerignore_keeps_secrets_and_data_out_of_the_image():

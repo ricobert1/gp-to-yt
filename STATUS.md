@@ -105,6 +105,29 @@
   queue.db built on the desktop cannot upload from the container; `auth` cannot run inside
   the container (no browser).
 
+## How unpack behaves (Takeout zips -> staging, 2026-11-12)
+- Human request: automate as much of the process as possible. Google Takeout has no API, so
+  requesting the export and downloading the zips stays manual; everything after is automatic.
+- `photos2yt unpack [--dry-run] [--inbox DIR]` (photos2yt/unpack.py): reads `takeout-*.zip`
+  in paths.takeout_inbox (new optional key; default `gp-to-yt-inbox` next to staging_dir,
+  deliberately not ~/Downloads, which macOS TCC blocks for launchd jobs). Extracts only
+  config.video_extensions and `.json` files to staging_dir/<export name>/<path in zip>,
+  where export name strips the `-NNN` part suffix, so all parts of one export share a tree
+  (sidecar matching is per folder and a video and its sidecar can be in different parts).
+- Safety: refuses absolute/`..`/drive paths in a zip; checks free space (needed + 1 GB)
+  before each zip; never overwrites (same size = already there, different = conflict,
+  kept and reported); writes `<name>.unpacking` then renames, so ingest never sees a partial
+  file. A zip that unpacked moves to `<inbox>/unpacked/`; a failed one stays in the inbox and
+  is retried. Every zip is logged to unpack_log.csv next to the DB. Exit 1 if any zip failed.
+  Partial downloads (`.crdownload`, `.download`) are ignored.
+- Known limit: if only some parts of an export are downloaded before a run, a video can be
+  ingested without its sidecar (its later sidecar is not re-read). RUNBOOK says to download all
+  parts first. A possible improvement: hold back an export until no part has been added for N
+  hours, or re-read sidecars for PENDING rows.
+- nightly.sh: unpack runs first (UNPACK=0 skips; a failure is reported, the run continues);
+  CLEANUP=1 adds cleanup after reconcile. scripts/launchd.py install gains --reconcile and
+  --cleanup (cleanup implies reconcile); status shows both.
+
 ## How cleanup behaves (local originals, 2026-11-11)
 - Requested by the human, who also approved the AGENT_RULES ground-rule exception (section
   0) that allows it. `photos2yt cleanup [--dry-run] [--dest DIR] [--delete --yes]

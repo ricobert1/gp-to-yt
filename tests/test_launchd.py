@@ -128,7 +128,7 @@ def test_uninstall_and_status(repo, tmp_path):
                     ffprobe="/x/ffprobe", out=lambda s: None)
     out: list[str] = []
     launchd.status(home=home, runner=FakeLaunchctl(), out=out.append)
-    assert "Time: 01:15 daily; UPLOAD_LIMIT=2" in out
+    assert "Time: 01:15 daily; UPLOAD_LIMIT=2; RECONCILE=0; CLEANUP=0" in out
     fake = FakeLaunchctl()
     out = []
     launchd.uninstall(home=home, runner=fake, out=out.append)
@@ -137,3 +137,12 @@ def test_uninstall_and_status(repo, tmp_path):
     out = []
     launchd.status(home=home, runner=FakeLaunchctl(), out=out.append)
     assert out == ["Not installed."]
+
+
+def test_reconcile_and_cleanup_switches(repo):
+    data = launchd.build_plist(repo, 3, 30, limit=5, ffprobe=None, reconcile=True, cleanup=True)
+    assert data["EnvironmentVariables"]["RECONCILE"] == "1"
+    assert data["EnvironmentVariables"]["CLEANUP"] == "1"
+    off = launchd.build_plist(repo, 3, 30, limit=5, ffprobe=None)
+    assert off["EnvironmentVariables"]["RECONCILE"] == "0"
+    assert off["EnvironmentVariables"]["CLEANUP"] == "0"

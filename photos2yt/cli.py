@@ -104,6 +104,17 @@ def create_parser() -> argparse.ArgumentParser:
                                 help="Only files whose video reconcile confirmed within this many "
                                      "days (default 7)")
 
+    # unpack: Takeout zips -> staging
+    unpack_parser = subparsers.add_parser(
+        "unpack",
+        help="Extract videos and sidecars from Google Takeout zips in the inbox into staging_dir",
+    )
+    unpack_parser.add_argument("--dry-run", action="store_true",
+                               help="List the zips and what would be extracted; writes nothing")
+    unpack_parser.add_argument("--inbox", default=None,
+                               help="Folder with takeout-*.zip files (default: paths.takeout_inbox, "
+                                    "else gp-to-yt-inbox next to staging_dir)")
+
     # make-rules: build rules.yaml from a short input file
     mr_parser = subparsers.add_parser(
         "make-rules",
@@ -496,6 +507,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 config, dry_run=args.dry_run, dest=args.dest, delete=args.delete,
                 yes=args.yes, max_age_days=args.max_age_days,
             )
+
+        if args.subcommand == "unpack":
+            from photos2yt.unpack import run_unpack
+            summary = run_unpack(config, inbox=Path(args.inbox) if args.inbox else None,
+                                 dry_run=args.dry_run)
+            return 1 if summary.zips_failed else 0
 
         if args.subcommand == "make-rules":
             from photos2yt.rulegen import default_paths, make_rules_file

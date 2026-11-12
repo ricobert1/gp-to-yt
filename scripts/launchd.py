@@ -2,7 +2,7 @@
 
 Run from the repository folder:
 
-    uv run python scripts/launchd.py install [--time HH:MM] [--limit N]
+    uv run python scripts/launchd.py install [--time HH:MM] [--limit N] [--reconcile] [--cleanup]
     uv run python scripts/launchd.py run-now      # start one run immediately
     uv run python scripts/launchd.py status
     uv run python scripts/launchd.py uninstall
@@ -60,7 +60,8 @@ def parse_time(value: str) -> tuple[int, int]:
 
 
 def build_plist(repo: Path, hour: int, minute: int, *, limit: int,
-                ffprobe: Optional[str], config: Optional[Path] = None) -> dict:
+                ffprobe: Optional[str], config: Optional[Path] = None,
+                reconcile: bool = False, cleanup: bool = False) -> dict:
     """The launchd job definition (a dict for plistlib)."""
     config = config or repo / "config.yaml"
     log = repo / "logs" / "nightly.log"
@@ -80,6 +81,8 @@ def build_plist(repo: Path, hour: int, minute: int, *, limit: int,
             "PATH": ":".join(path_dirs),
             "PHOTOS2YT_CONFIG": str(config),
             "UPLOAD_LIMIT": str(limit),
+            "RECONCILE": "1" if reconcile else "0",
+            "CLEANUP": "1" if cleanup else "0",
         },
         "StartCalendarInterval": {"Hour": hour, "Minute": minute},
         "StandardOutPath": str(log),
@@ -102,7 +105,8 @@ def _run(cmd: Sequence[str]) -> subprocess.CompletedProcess:
 
 def install(hour: int, minute: int, *, limit: int, repo: Path = REPO,
             home: Optional[Path] = None, runner: Runner = _run,
-            ffprobe: Optional[str] = "auto", out=print) -> int:
+            ffprobe: Optional[str] = "auto", reconcile: bool = False,
+            cleanup: bool = False, out=print) -> int:
     if ffprobe == "auto":
         ffprobe = shutil.which("ffprobe")
     if not (repo / ".venv" / "bin" / "photos2yt").exists():
@@ -116,7 +120,8 @@ def install(hour: int, minute: int, *, limit: int, repo: Path = REPO,
     (repo / "logs").mkdir(exist_ok=True)
     target = plist_path(home)
     target.parent.mkdir(parents=True, exist_ok=True)
-    data = build_plist(repo, hour, minute, limit=limit, ffprobe=ffprobe)
+    data = build_plist(repo, hour, minute, limit=limit, ffprobe=ffprobe,
+                       reconcile=reconcile, cleanup=cleanup)
     runner(["launchctl", "bootout", f"{_domain()}/{LABEL}"])  # unload an older copy; may fail
     target.write_bytes(plistlib.dumps(data))
     result = runner(["launchctl", "bootstrap", _domain(), str(target)])
@@ -124,8 +129,10 @@ def install(hour: int, minute: int, *, limit: int, repo: Path = REPO,
         out(f"launchctl bootstrap failed: {(result.stderr or result.stdout).strip()}")
         return 1
     out(f"Installed {target}")
-    out(f"Runs every day at {hour:02d}:{minute:02d} (this Mac's time), "
-        f"uploading up to {limit} video(s).")
+    extras = [name for name, on in (("reconcile", reconcile), ("cleanup", cleanup)) if on]
+    out(f"Runs every day at {hour:02d}:{minute:02d} (this Mac's time): unpack, ingest, "
+        f"upload up to {limit} video(s), curate"
+        + (", " + ", ".join(extras) if extras else "") + ", report.")
     out(f"Log: {repo / 'logs' / 'nightly.log'}")
     out("Test it now with: uv run python scripts/launchd.py run-now")
     return 0
@@ -160,8 +167,10 @@ def status(*, home: Optional[Path] = None, runner: Runner = _run, out=print) -> 
     data = plistlib.loads(target.read_bytes())
     when = data["StartCalendarInterval"]
     out(f"Installed: {target}")
+    env = data["EnvironmentVariables"]
     out(f"Time: {when['Hour']:02d}:{when['Minute']:02d} daily; "
-        f"UPLOAD_LIMIT={data['EnvironmentVariables']['UPLOAD_LIMIT']}")
+        f"UPLOAD_LIMIT={env['UPLOAD_LIMIT']}; "
+        f"RECONCILE={env.get('RECONCILE', '0')}; CLEANUP={env.get('CLEANUP', '0')}")
     result = runner(["launchctl", "print", f"{_domain()}/{LABEL}"])
     loaded = result.returncode == 0
     out(f"Loaded in launchd: {'yes' if loaded else 'no'}")
@@ -184,6 +193,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_install.add_argument("--time", type=parse_time, default=None,
                            help="HH:MM in this Mac's time (default: 00:30 Pacific converted)")
     p_install.add_argument("--limit", type=int, default=5, help="uploads per run (default 5)")
+    p_install.add_argument("--reconcile", action="store_true",
+                           help="also run reconcile each night (1 unit per 50 videos)")
+    p_install.add_argument("--cleanup", action="store_true",
+                           help="also run cleanup each night (moves confirmed originals out of "
+                                "staging; implies --reconcile)")
     sub.add_parser("uninstall", help="unload and delete the launchd job")
     sub.add_parser("run-now", help="start one run immediately")
     sub.add_parser("status", help="show schedule, last exit code and last log lines")
@@ -196,7 +210,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.limit < 0:
             parser.error("--limit must be zero or positive")
         hour, minute = args.time if args.time else default_local_time()
-        return install(hour, minute, limit=args.limit)
+        return install(hour, minute, limit=args.limit,
+                       reconcile=args.reconcile or args.cleanup, cleanup=args.cleanup)
     if args.action == "uninstall":
         return uninstall()
     if args.action == "run-now":

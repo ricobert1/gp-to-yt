@@ -1,7 +1,10 @@
 #!/bin/sh
-# Nightly run: ingest -> upload --limit N -> curate -> report.
+# Nightly run: unpack -> ingest -> upload --limit N -> curate
+#              -> [reconcile] -> [cleanup] -> report.
 #
 # Exit code: 0 if every step succeeded, 1 if any step failed.
+# - unpack (Takeout zips in the inbox -> staging) failing is reported but the
+#   run continues with what is already in staging.
 # - ingest failing stops the run (upload and curate depend on it).
 # - upload exits 1 when *some* videos failed; the others were uploaded, so
 #   curate and report still run, and the final exit code is still 1.
@@ -11,6 +14,8 @@
 # quota.daily_unit_limit 10000 and upload_cost_units 1600, 5 uploads use
 # 8005 units and leave about 2000 for curate (playlist adds are 50 each).
 # RECONCILE=1 also runs `reconcile` (1 unit per 50 uploaded videos) before report.
+# CLEANUP=1 also runs `cleanup` (moves local originals confirmed on YouTube out of
+# staging) after reconcile. UNPACK=0 skips the unpack step.
 set -u
 
 LIMIT="${UPLOAD_LIMIT:-5}"
@@ -27,11 +32,17 @@ run() {
     return "$rc"
 }
 
+if [ "${UNPACK:-1}" = "1" ]; then
+    run unpack
+fi
 run ingest || { echo "== ingest failed; not uploading." >&2; exit 1; }
 run upload --limit "$LIMIT"
 run curate
 if [ "${RECONCILE:-0}" = "1" ]; then
     run reconcile
+fi
+if [ "${CLEANUP:-0}" = "1" ]; then
+    run cleanup
 fi
 run report
 

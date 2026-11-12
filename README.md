@@ -87,6 +87,7 @@ file. The important keys:
 |---|---|
 | `paths.staging_dir` | The extracted Takeout `Google Photos` folder (only read, never changed). |
 | `paths.db_path` | The SQLite queue (`queue.db`). Back it up: it is the record of what was uploaded. |
+| `paths.takeout_inbox` | Folder `unpack` reads Takeout zips from (optional; default `gp-to-yt-inbox` next to the staging folder; not Downloads/Desktop/Documents). |
 | `paths.uploaded_dir` | Where `cleanup` moves originals (optional; default `<staging_dir>-uploaded` next to the staging folder). |
 | `paths.rules` | Playlist rules for `curate`. If this key is set the file must exist (see below). |
 | `timezone` | Your local time zone; decides local dates for titles and playlist rules. |
@@ -120,6 +121,8 @@ photos2yt [-c config.yaml] <command>
   retitle [--dry-run]         rebuild titles of videos not uploaded yet
   reconcile [--dry-run]       videos.list check of every uploaded video (1 unit per 50)
   report [--out-dir DIR]      manifest.csv + summary.txt (no API calls)
+  unpack [--dry-run] [--inbox DIR]
+                              extract videos + sidecars from Takeout zips in the inbox into staging_dir
   cleanup [--dry-run] [--delete --yes] [--dest DIR] [--max-age-days N]
                               move local originals confirmed on YouTube out of staging_dir
 ```
@@ -190,8 +193,12 @@ Notes:
 `photos2yt-nightly` (from `scripts/nightly.sh`, installed in the image) runs:
 
 ```text
-ingest  →  upload --limit $UPLOAD_LIMIT  →  curate  →  [reconcile if RECONCILE=1]  →  report
+[unpack]  →  ingest  →  upload --limit $UPLOAD_LIMIT  →  curate  →  [reconcile]  →  [cleanup]  →  report
 ```
+
+(`UNPACK=0` skips unpack; `RECONCILE=1` and `CLEANUP=1` turn those on. On the Mac,
+`scripts/launchd.py install --cleanup` sets both. In Docker, staging is read-only,
+so use `UNPACK=0` and leave cleanup off.)
 
 - If **ingest** fails, nothing else runs (exit 1).
 - If **upload** fails for some videos, the others were uploaded, so curate and

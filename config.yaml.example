@@ -4,6 +4,7 @@ paths:
   credentials: credentials.json
   token: token.json
   rules: rules.yaml               # playlist rules for `curate` (default: rules.yaml next to this file)
+  # takeout_inbox: /path/to/gp-to-yt-inbox   # where `unpack` finds Takeout zips (default: gp-to-yt-inbox next to staging_dir)
   # uploaded_dir: /path/to/takeout/Google Photos-uploaded   # where `cleanup` moves originals (default: <staging_dir>-uploaded)
 timezone: America/New_York        # local-date rule for recordingDate / playlist rules
 youtube:
